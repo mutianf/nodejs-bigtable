@@ -2733,6 +2733,52 @@ describe('Bigtable/Table', () => {
       });
     });
 
+    describe('omitted response entry on OK stream', () => {
+      it('should report PartialFailureError with INTERNAL status without retrying', done => {
+        let requestCount = 0;
+        table.bigtable.request = () => {
+          requestCount++;
+          const stream = new PassThrough({
+            objectMode: true,
+          });
+
+          setImmediate(() => {
+            stream.end({
+              entries: [
+                {
+                  index: 0,
+                  status: {
+                    code: 0,
+                  },
+                },
+              ],
+            });
+          });
+
+          return stream;
+        };
+
+        table.maxRetries = 3;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        table.mutate(entries, (err: any) => {
+          try {
+            assert.strictEqual(requestCount, 1);
+            assert.strictEqual(err.name, 'PartialFailureError');
+            assert.strictEqual(err.errors.length, 1);
+            assert.strictEqual(err.errors[0].code, 13);
+            assert.strictEqual(
+              err.errors[0].message,
+              'Mutation result missing from server response',
+            );
+            assert.strictEqual(err.errors[0].index, 1);
+            done();
+          } catch (e) {
+            done(e);
+          }
+        });
+      });
+    });
+
     describe('retries', () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       let fakeStatuses: any;
