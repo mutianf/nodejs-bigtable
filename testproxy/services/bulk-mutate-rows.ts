@@ -47,9 +47,17 @@ export const bulkMutateRows: ClientImplMaker<
       };
     } catch (e) {
       const error = e as PartialFailureError & ErrorCode;
-      const entries = error.errors
+      const resultEntries = error.errors
         ? Array.from(error.errors.entries()).map(([index, err]) => ({
-            index: index + 1,
+            index:
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              (err as any).index !== undefined
+                ? // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  (err as any).index
+                : entries
+                  ? // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    entries.indexOf((err as any).entry)
+                  : index + 1,
             status: {
               code: (err as ErrorCode).code,
               message: err.message,
@@ -62,7 +70,7 @@ export const bulkMutateRows: ClientImplMaker<
           details: [],
           message: error.message,
         },
-        entries,
+        entries: resultEntries,
       };
     }
   });

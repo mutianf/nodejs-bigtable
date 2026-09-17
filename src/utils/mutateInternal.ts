@@ -91,6 +91,7 @@ export function mutateInternal(
     entries.map((entry: Entry, index: number) => [entry, index]),
   );
   const mutationErrorsByEntryIndex = new Map();
+  let seenEntryIndices = new Set<number>();
 
   const isRetryable = (err: ServiceError | null, timeoutExceeded: boolean) => {
     if (timeoutExceeded) {
@@ -112,6 +113,20 @@ export function mutateInternal(
     if (numRequestsMade === 0) {
       collectMetricsCallback(err, err);
       return;
+    }
+
+    if (!err) {
+      for (const origIdx of Array.from(pendingEntryIndices)) {
+        if (!seenEntryIndices.has(origIdx)) {
+          pendingEntryIndices.delete(origIdx);
+          mutationErrorsByEntryIndex.set(origIdx, {
+            code: 13,
+            message: 'Mutation result missing from server response',
+            entry: entries[origIdx],
+            index: origIdx,
+          });
+        }
+      }
     }
 
     const timeoutExceeded = !!(
@@ -161,6 +176,7 @@ export function mutateInternal(
   metricsCollector.onOperationStart();
   const makeNextBatchRequest = () => {
     metricsCollector.onAttemptStart();
+    seenEntryIndices = new Set<number>();
     const entryBatch = entries.filter((entry: Entry, index: number) => {
       return pendingEntryIndices.has(index);
     });
@@ -212,9 +228,14 @@ export function mutateInternal(
         onBatchResponse(err);
       })
       .on('data', (obj: google.bigtable.v2.IMutateRowsResponse) => {
-        obj.entries!.forEach(entry => {
-          const originalEntry = entryBatch[entry.index as number];
+        obj.entries!.forEach((entry, arrayIdx) => {
+          const entryIdx =
+            entry.index !== undefined && entry.index !== null
+              ? Number(entry.index)
+              : arrayIdx;
+          const originalEntry = entryBatch[entryIdx];
           const originalEntriesIndex = entryToIndex.get(originalEntry)!;
+          seenEntryIndices.add(originalEntriesIndex);
 
           // Mutation was successful.
           if (entry.status!.code === 0) {
@@ -228,6 +249,8 @@ export function mutateInternal(
           const errorDetails = entry.status;
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           (errorDetails as any).entry = originalEntry;
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (errorDetails as any).index = originalEntriesIndex;
           mutationErrorsByEntryIndex.set(originalEntriesIndex, errorDetails);
         });
       })
