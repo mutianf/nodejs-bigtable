@@ -24,15 +24,35 @@ const execSync = cmd => cp.execSync(cmd, {encoding: 'utf-8'});
 const TABLE_ID = `mobile-time-series-${uuid.v4()}`.substr(0, 30); // Bigtable naming rules
 
 describe('writes', async () => {
-  const instance = await obtainTestInstance();
-  const INSTANCE_ID = instance.id;
-  let table;
+  let INSTANCE_ID;
 
   before(async () => {
-    table = instance.table(TABLE_ID);
+    const [instance] = await obtainTestInstance();
+    INSTANCE_ID = instance.displayName;
 
-    await table.create().catch(console.error);
-    await table.createFamily('stats_summary').catch(console.error);
+    const {BigtableTableAdminClient} = require('@google-cloud/bigtable').v2;
+    const adminClient = new BigtableTableAdminClient();
+    const projectId = await adminClient.getProjectId();
+    const instancePath = `projects/${projectId}/instances/${INSTANCE_ID}`;
+    const tablePath = `${instancePath}/tables/${TABLE_ID}`;
+    const request = {
+      parent: instancePath,
+      tableId: TABLE_ID,
+      table: {},
+    };
+    await adminClient.createTable(request).catch(console.error);
+    const modifyFamiliesReq = {
+      name: tablePath,
+      modifications: [
+        {
+          id: 'stats_summary',
+          create: {},
+        },
+      ],
+    };
+    await adminClient
+      .modifyColumnFamilies(modifyFamiliesReq)
+      .catch(console.error);
   });
 
   it('should do a simple write', async () => {
@@ -42,7 +62,7 @@ describe('writes', async () => {
 
   it('should do a conditional write', () => {
     const stdout = execSync(
-      `node writeConditionally ${INSTANCE_ID} ${TABLE_ID}`
+      `node writeConditionally ${INSTANCE_ID} ${TABLE_ID}`,
     );
     assert.match(stdout, /Successfully updated row's os_name/);
   });

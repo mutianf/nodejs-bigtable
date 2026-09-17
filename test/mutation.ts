@@ -47,7 +47,7 @@ describe('Bigtable/Mutation', () => {
       it('should convert a base64 encoded number when true', () => {
         const num = 10;
         const encoded = Buffer.from(Long.fromNumber(num).toBytesBE()).toString(
-          'base64'
+          'base64',
         );
         const decoded = Mutation.convertFromBytes(encoded, {
           isPossibleNumber: true,
@@ -59,7 +59,7 @@ describe('Bigtable/Mutation', () => {
       it('should convert a base64 encoded MIN_SAFE_INTEGER number when true', () => {
         const num = Number.MIN_SAFE_INTEGER;
         const encoded = Buffer.from(Long.fromNumber(num).toBytesBE()).toString(
-          'base64'
+          'base64',
         );
         const decoded = Mutation.convertFromBytes(encoded, {
           isPossibleNumber: true,
@@ -71,7 +71,7 @@ describe('Bigtable/Mutation', () => {
       it('should convert a base64 encoded MAX_SAFE_INTEGER number when true', () => {
         const num = Number.MAX_SAFE_INTEGER;
         const encoded = Buffer.from(Long.fromNumber(num).toBytesBE()).toString(
-          'base64'
+          'base64',
         );
         const decoded = Mutation.convertFromBytes(encoded, {
           isPossibleNumber: true,
@@ -83,7 +83,7 @@ describe('Bigtable/Mutation', () => {
       it('should not convert a base64 encoded smaller than MIN_SAFE_INTEGER number when true', () => {
         const num = Number.MIN_SAFE_INTEGER - 100;
         const encoded = Buffer.from(Long.fromNumber(num).toBytesBE()).toString(
-          'base64'
+          'base64',
         );
         const decoded = Mutation.convertFromBytes(encoded, {
           isPossibleNumber: true,
@@ -95,7 +95,7 @@ describe('Bigtable/Mutation', () => {
       it('should not convert a base64 encoded larger than MAX_SAFE_INTEGER number when true', () => {
         const num = Number.MAX_SAFE_INTEGER + 100;
         const encoded = Buffer.from(Long.fromNumber(num).toBytesBE()).toString(
-          'base64'
+          'base64',
         );
         const decoded = Mutation.convertFromBytes(encoded, {
           isPossibleNumber: true,
@@ -107,7 +107,7 @@ describe('Bigtable/Mutation', () => {
       it('should not convert a base64 encoded number when false', () => {
         const num = 10;
         const encoded = Buffer.from(Long.fromNumber(num).toBytesBE()).toString(
-          'base64'
+          'base64',
         );
         const decoded = Mutation.convertFromBytes(encoded);
 
@@ -145,7 +145,12 @@ describe('Bigtable/Mutation', () => {
       assert.strictEqual(decoded.toString(), message);
     });
 
-    it('should not create a new Buffer needlessly', () => {
+    it('should not create a new Buffer needlessly', function () {
+      if (process.platform === 'win32') {
+        // stubbing Buffer.from does not work on Windows since sinon 15.1.0
+        // TODO(@alexander-fenster): investigate and report or fix
+        this.skip();
+      }
       const message = 'Hello!';
       const encoded = Buffer.from(message);
       const stub = sandbox.stub(Buffer, 'from');
@@ -460,6 +465,13 @@ describe('Bigtable/Mutation', () => {
       assert.strictEqual(parsed.family, 'a');
       assert.strictEqual(parsed.qualifier, undefined);
     });
+
+    it('should parse a qualifier name with colons', () => {
+      const parsed = Mutation.parseColumnName('a:b:c');
+
+      assert.strictEqual(parsed.family, 'a');
+      assert.strictEqual(parsed.qualifier, 'b:c');
+    });
   });
 
   describe('toProto', () => {
@@ -482,10 +494,10 @@ describe('Bigtable/Mutation', () => {
         data: [],
       };
       const mutation = new Mutation(data);
-      Mutation.encodeSetCell = _data => {
+      sandbox.stub(Mutation, 'encodeSetCell').callsFake(_data => {
         assert.strictEqual(_data, data.data);
         return fakeEncoded;
-      };
+      });
       const mutationProto = mutation.toProto();
       assert.strictEqual(mutationProto.mutations, fakeEncoded);
       assert.strictEqual(mutationProto.rowKey, data.key);

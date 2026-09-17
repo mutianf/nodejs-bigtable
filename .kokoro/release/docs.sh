@@ -16,7 +16,7 @@
 
 set -eo pipefail
 
-# build jsdocs (Python is installed on the Node 10 docker image).
+# build jsdocs (Python is installed on the Node 18 docker image).
 if [[ -z "$CREDENTIALS" ]]; then
   # if CREDENTIALS are explicitly set, assume we're testing locally
   # and don't set NPM_CONFIG_PREFIX.
@@ -29,7 +29,6 @@ npm run docs
 
 # create docs.metadata, based on package.json and .repo-metadata.json.
 npm i json@9.0.6 -g
-python3 -m pip install --user gcp-docuploader
 python3 -m docuploader create-metadata \
   --name=$(cat .repo-metadata.json | json name) \
   --version=$(cat package.json | json version) \

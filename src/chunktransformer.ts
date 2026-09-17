@@ -14,8 +14,13 @@
 
 import {Transform, TransformOptions} from 'stream';
 import {Bytes, Mutation} from './mutation';
+import {TableUtils} from './utils/table';
 
 export type Value = string | number | boolean | Uint8Array;
+
+export enum DataEvent {
+  LAST_ROW_KEY_UPDATE,
+}
 
 export interface Chunk {
   rowContents: Value;
@@ -33,7 +38,7 @@ export interface Data {
   chunks: Chunk[];
   lastScannedRowKey?: Buffer;
 }
-interface Family {
+export interface Family {
   [qualifier: string]: Qualifier[];
 }
 export interface Qualifier {
@@ -50,6 +55,12 @@ export interface TransformErrorProps {
   message: string;
   chunk: Chunk | null;
 }
+export interface ChunkPushLastScannedRowData {
+  eventType: DataEvent.LAST_ROW_KEY_UPDATE;
+  lastScannedRowKey?: string;
+}
+
+export type ChunkPushData = Row | ChunkPushLastScannedRowData;
 
 class TransformError extends Error {
   constructor(props: TransformErrorProps) {
@@ -105,7 +116,7 @@ export class ChunkTransformer extends Transform {
         new TransformError({
           message: 'Response ended with pending row without commit',
           chunk: null,
-        })
+        }),
       );
       return;
     }
@@ -128,10 +139,10 @@ export class ChunkTransformer extends Transform {
    * @public
    *
    * @param {object} data readrows response containing array of chunks.
-   * @param {object} [enc] encoding options.
+   * @param {object} [_encoding] encoding options.
    * @param {callback} next callback will be called once data is processed, with error if any error in processing
    */
-  _transform(data: Data, enc: string, next: Function): void {
+  _transform(data: Data, _encoding: string, next: Function): void {
     for (const chunk of data.chunks!) {
       switch (this.state) {
         case RowStateEnum.NEW_ROW:
@@ -147,6 +158,7 @@ export class ChunkTransformer extends Transform {
           break;
       }
       if (this._destroyed) {
+        next();
         return;
       }
     }
@@ -155,8 +167,21 @@ export class ChunkTransformer extends Transform {
         data.lastScannedRowKey as Bytes,
         {
           userOptions: this.options,
-        }
+        },
       );
+      /**
+       * Push an event that will update the lastRowKey in the user stream after
+       * all rows ahead of this event have reached the user stream. This will
+       * ensure that a retry excludes the lastScannedRow as this is required
+       * for the TestReadRows_Retry_LastScannedRow conformance test to pass. It
+       * is important to use a 'data' event to update the last row key in order
+       * to allow all the data queued ahead of this event to reach the user
+       * stream first.
+       */
+      this.push({
+        eventType: DataEvent.LAST_ROW_KEY_UPDATE,
+        lastScannedRowKey: this.lastRowKey,
+      });
     }
     next();
   }
@@ -166,13 +191,14 @@ export class ChunkTransformer extends Transform {
    * @public
    * @param {error} err error if any
    */
-  destroy(err?: Error): void {
-    if (this._destroyed) return;
+  destroy(err?: Error): this {
+    if (this._destroyed) return this;
     this._destroyed = true;
     if (err) {
       this.emit('error', err);
     }
     this.emit('close');
+    return this;
   }
 
   /**
@@ -208,7 +234,7 @@ export class ChunkTransformer extends Transform {
         new TransformError({
           message: 'A row cannot be have a value size and be a commit row',
           chunk,
-        })
+        }),
       );
     }
   }
@@ -224,13 +250,22 @@ export class ChunkTransformer extends Transform {
       chunk.familyName ||
       chunk.qualifier ||
       (chunk.value && chunk.value.length !== 0) ||
-      chunk.timestampMicros! > 0;
+      // timestampMicros is an int64 in the protobuf definition,
+      // which can be either a number or an instance of Long.
+      // If it's a number...
+      (typeof chunk.timestampMicros === 'number' &&
+        chunk.timestampMicros! > 0) ||
+      // If it's an instance of Long...
+      (typeof chunk.timestampMicros === 'object' &&
+        'compare' in chunk.timestampMicros &&
+        typeof chunk.timestampMicros.compare === 'function' &&
+        chunk.timestampMicros.compare(0) === 1);
     if (chunk.resetRow && containsData) {
       this.destroy(
         new TransformError({
           message: 'A reset should have no data',
           chunk,
-        })
+        }),
       );
     }
   }
@@ -258,6 +293,11 @@ export class ChunkTransformer extends Transform {
       errorMessage = 'A new row cannot be reset';
     } else if (lastRowKey === newRowKey) {
       errorMessage = 'A commit happened but the same key followed';
+    } else if (
+      typeof lastRowKey !== 'undefined' &&
+      TableUtils.lessThanOrEqualTo(newRowKey as string, lastRowKey as string)
+    ) {
+      errorMessage = 'A row key must be strictly increasing';
     } else if (!chunk.familyName) {
       errorMessage = 'A family must be set';
     } else if (chunk.qualifier === null || chunk.qualifier === undefined) {
@@ -292,7 +332,7 @@ export class ChunkTransformer extends Transform {
           new TransformError({
             message: 'A commit is required between row keys',
             chunk,
-          })
+          }),
         );
         return;
       }
@@ -305,7 +345,7 @@ export class ChunkTransformer extends Transform {
         new TransformError({
           message: 'A qualifier must be specified',
           chunk,
-        })
+        }),
       );
       return;
     }
@@ -362,7 +402,7 @@ export class ChunkTransformer extends Transform {
         chunk.qualifier.value as Bytes,
         {
           userOptions: this.options,
-        }
+        },
       );
       this.qualifiers = this.family[qualifierName as {} as string] = [];
       this.qualifier = {
@@ -398,7 +438,7 @@ export class ChunkTransformer extends Transform {
         chunk.qualifier.value as Bytes,
         {
           userOptions: this.options,
-        }
+        },
       ) as string;
       this.qualifiers = this.family![qualifierName] =
         this.family![qualifierName] || [];
@@ -429,7 +469,7 @@ export class ChunkTransformer extends Transform {
       chunk.value! as Bytes,
       {
         userOptions: this.options,
-      }
+      },
     );
 
     if (

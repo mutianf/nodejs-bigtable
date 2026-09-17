@@ -20,7 +20,6 @@ import * as pumpify from 'pumpify';
 import * as sinon from 'sinon';
 import {PassThrough, Writable, Duplex} from 'stream';
 import {ServiceError} from 'google-gax';
-import {DecoratedStatus} from '../src/decorateStatus';
 
 import * as inst from '../src/instance';
 import {ChunkTransformer} from '../src/chunktransformer.js';
@@ -28,9 +27,15 @@ import {Family} from '../src/family.js';
 import {Mutation} from '../src/mutation.js';
 import {Row} from '../src/row.js';
 import * as tblTypes from '../src/table';
-import * as ds from '../src/decorateStatus.js';
-import {Bigtable} from '../src';
+import {Bigtable, RequestOptions} from '../src';
 import {EventEmitter} from 'events';
+import {TableUtils} from '../src/utils/table';
+import {ClientSideMetricsConfigManager} from '../src/client-side-metrics/metrics-config-manager';
+import {OperationMetricsCollector} from '../src/client-side-metrics/operation-metrics-collector';
+import {SinonSpy} from 'sinon';
+import {TabularApiSurface} from '../src/tabular-api-surface';
+import {GetRowsOptions} from '../src/table';
+import {mutateInternal} from '../src/utils/mutateInternal';
 
 const sandbox = sinon.createSandbox();
 const noop = () => {};
@@ -60,6 +65,24 @@ function createFake(klass: any) {
   };
 }
 
+class FakeMetricsCollector {
+  onOperationStart() {}
+  onOperationComplete() {}
+  onResponse() {}
+  onAttemptStart() {}
+  onAttemptComplete() {}
+  onMetadataReceived() {}
+  wrapRequest() {}
+  onStatusMetadataReceived() {}
+  onRowReachesUser() {}
+}
+
+class FakeMetricsConfigManager extends ClientSideMetricsConfigManager {
+  createOperation() {
+    return new FakeMetricsCollector() as unknown as OperationMetricsCollector;
+  }
+}
+
 const FakeFamily = createFake(Family);
 FakeFamily.formatRule_ = sinon.spy(rule => rule);
 
@@ -73,7 +96,7 @@ const FakeChunkTransformer = createFake(ChunkTransformer);
 FakeChunkTransformer.prototype._transform = function (
   rows: Row[],
   enc: {},
-  next: Function
+  next: Function,
 ) {
   rows.forEach(row => this.push(row));
   next();
@@ -101,6 +124,53 @@ const FakeFilter = {
   },
 };
 
+function getTableMock(
+  createReadStreamInternal: (
+    table: TabularApiSurface,
+    singleRow: boolean,
+    opts?: GetRowsOptions,
+  ) => PassThrough,
+) {
+  const FakeGetRows = proxyquire('../src/utils/getRowsInternal.js', {
+    './createReadStreamInternal': {
+      createReadStreamInternal: createReadStreamInternal,
+    },
+  });
+  const FakeMutateInternal = proxyquire('../src/utils/mutateInternal.js', {
+    '../row.js': {Row: FakeRow},
+    '../chunktransformer.js': {ChunkTransformer: FakeChunkTransformer},
+    '../filter.js': {Filter: FakeFilter},
+    '../mutation.js': {Mutation: FakeMutation},
+    pumpify,
+  }).mutateInternal;
+  const FakeTabularApiSurface = proxyquire('../src/tabular-api-surface.js', {
+    '@google-cloud/promisify': fakePromisify,
+    './family.js': {Family: FakeFamily},
+    './mutation.js': {Mutation: FakeMutation},
+    './filter.js': {Filter: FakeFilter},
+    pumpify,
+    './row.js': {Row: FakeRow},
+    './chunktransformer.js': {ChunkTransformer: FakeChunkTransformer},
+    './utils/createReadStreamInternal': {
+      createReadStreamInternal,
+    },
+    './utils/mutateInternal': {
+      mutateInternal: FakeMutateInternal,
+    },
+    './utils/getRowsInternal': {
+      getRowsInternal: FakeGetRows.getRowsInternal,
+    },
+  }).TabularApiSurface;
+  const Table = proxyquire('../src/table.js', {
+    '@google-cloud/promisify': fakePromisify,
+    './family.js': {Family: FakeFamily},
+    './mutation.js': {Mutation: FakeMutation},
+    './row.js': {Row: FakeRow},
+    './tabular-api-surface': {TabularApiSurface: FakeTabularApiSurface},
+  }).Table;
+  return Table;
+}
+
 describe('Bigtable/Table', () => {
   const TABLE_ID = 'my-table';
   let INSTANCE: inst.Instance;
@@ -111,20 +181,26 @@ describe('Bigtable/Table', () => {
   let table: any;
 
   before(() => {
-    Table = proxyquire('../src/table.js', {
-      '@google-cloud/promisify': fakePromisify,
-      './family.js': {Family: FakeFamily},
-      './mutation.js': {Mutation: FakeMutation},
-      './filter.js': {Filter: FakeFilter},
-      pumpify,
-      './row.js': {Row: FakeRow},
-      './chunktransformer.js': {ChunkTransformer: FakeChunkTransformer},
-    }).Table;
+    const FakeCreateReadStreamInternal = proxyquire(
+      '../src/utils/createReadStreamInternal.js',
+      {
+        '../row.js': {Row: FakeRow},
+        '../chunktransformer.js': {ChunkTransformer: FakeChunkTransformer},
+        '../filter.js': {Filter: FakeFilter},
+        '../mutation.js': {Mutation: FakeMutation},
+        pumpify,
+      },
+    ).createReadStreamInternal;
+    Table = getTableMock(FakeCreateReadStreamInternal);
   });
 
   beforeEach(() => {
     INSTANCE = {
-      bigtable: {} as Bigtable,
+      bigtable: {
+        _metricsConfigManager: new FakeMetricsConfigManager(
+          [],
+        ) as ClientSideMetricsConfigManager,
+      } as Bigtable,
       name: 'a/b/c/d',
     } as inst.Instance;
     TABLE_NAME = INSTANCE.name + '/tables/' + TABLE_ID;
@@ -210,7 +286,7 @@ describe('Bigtable/Table', () => {
       table.instance.createTable = (
         id: string,
         options_: {},
-        callback: Function
+        callback: Function,
       ) => {
         assert.strictEqual(id, table.id);
         assert.strictEqual(options_, options);
@@ -224,7 +300,7 @@ describe('Bigtable/Table', () => {
       table.instance.createTable = (
         id: string,
         options: {},
-        callback: Function
+        callback: Function,
       ) => {
         assert.deepStrictEqual(options, {});
         callback(); // done()
@@ -334,7 +410,7 @@ describe('Bigtable/Table', () => {
       table.createBackup(BACKUP_ID, CONFIG, (err: Error) => {
         assert.strictEqual(
           err.message,
-          'No ready clusters eligible for backup.'
+          'No ready clusters eligible for backup.',
         );
         done();
       });
@@ -509,7 +585,7 @@ describe('Bigtable/Table', () => {
           assert.strictEqual(family, null);
           assert.strictEqual(response, apiResponse);
           done();
-        }
+        },
       );
     });
 
@@ -533,7 +609,7 @@ describe('Bigtable/Table', () => {
           assert.strictEqual(family.metadata, response);
           assert.strictEqual(apiResponse, response);
           done();
-        }
+        },
       );
     });
   });
@@ -546,7 +622,9 @@ describe('Bigtable/Table', () => {
         assert.strictEqual(config.method, 'readRows');
         assert.strictEqual(config.reqOpts.tableName, TABLE_NAME);
         assert.strictEqual(config.reqOpts.appProfileId, undefined);
-        assert.strictEqual(config.gaxOpts, undefined);
+        assert.deepStrictEqual(config.gaxOpts, {
+          otherArgs: {headers: {'bigtable-attempt': 0}},
+        });
         done();
       };
       table.createReadStream();
@@ -559,7 +637,7 @@ describe('Bigtable/Table', () => {
       bigtableInstance.request = (config: any) => {
         assert.strictEqual(
           config.reqOpts.appProfileId,
-          bigtableInstance.appProfileId
+          bigtableInstance.appProfileId,
         );
         done();
       };
@@ -714,7 +792,7 @@ describe('Bigtable/Table', () => {
           assert.strictEqual(
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             (parseSpy as any).getCall(0).args[0],
-            options.filter
+            options.filter,
           );
           done();
         };
@@ -827,7 +905,7 @@ describe('Bigtable/Table', () => {
 
         afterEach(() => {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (Table as any).createPrefixRange.restore();
+          (TableUtils as any).createPrefixRange.restore();
         });
 
         it('should transform the prefix into a range', done => {
@@ -840,7 +918,7 @@ describe('Bigtable/Table', () => {
           const fakePrefix = 'abc';
 
           const prefixSpy = sandbox
-            .stub(Table, 'createPrefixRange')
+            .stub(TableUtils, 'createPrefixRange')
             .returns(fakePrefixRange);
 
           const rangeSpy = sandbox
@@ -871,7 +949,7 @@ describe('Bigtable/Table', () => {
             {start: 'def', end: 'deg'},
           ] as {} as tblTypes.PrefixRange[];
           const prefixSpy = sandbox
-            .stub(Table, 'createPrefixRange')
+            .stub(TableUtils, 'createPrefixRange')
             .callsFake(() => {
               const callIndex = prefixSpy.callCount - 1;
               return prefixRanges[callIndex];
@@ -933,13 +1011,18 @@ describe('Bigtable/Table', () => {
       ];
 
       beforeEach(() => {
-        sinon.stub(table, 'row').callsFake(() => {
-          return {} as Row;
+        sinon.stub(table, 'row').callsFake((...args: unknown[]) => {
+          return {
+            id: args[0] as string,
+            table: table,
+            bigtable: table.bigtable,
+            data: {},
+          } as Row;
         });
         FakeChunkTransformer.prototype._transform = function (
           chunks: Array<{}>,
           enc: {},
-          next: Function
+          next: Function,
         ) {
           formattedRows.forEach(row => this.push(row));
           next();
@@ -1071,7 +1154,7 @@ describe('Bigtable/Table', () => {
         FakeChunkTransformer.prototype._transform = (
           chunks: {},
           enc: {},
-          next: Function
+          next: Function,
         ) => {
           next(error);
         };
@@ -1107,7 +1190,52 @@ describe('Bigtable/Table', () => {
           .on('data', done);
       });
     });
-
+    it('Should respect the timeout parameter passed in for UNAVAILABLE error', done => {
+      // The timeout is 2 seconds, but the error is received after 3 seconds
+      // so the client doesn't retry because more than 2 seconds have elapsed.
+      const requestSpy = (table.bigtable.request = sinon.spy(() => {
+        const stream = new PassThrough({
+          objectMode: true,
+        });
+        (stream as any).abort = () => {};
+        setTimeout(() => {
+          const error = new Error('retry me!') as ServiceError;
+          error.code = 14;
+          stream.emit('error', error);
+        }, 3000);
+        return stream;
+      }));
+      const stream = table.createReadStream({gaxOptions: {timeout: 2000}});
+      stream.on('error', (error: ServiceError) => {
+        assert.strictEqual(error.code, 14);
+        assert.strictEqual(error.message, 'retry me!');
+        assert.strictEqual(requestSpy.callCount, 1); // Ensures the client has not retried.
+        done();
+      });
+    });
+    it('Should respect the timeout parameter passed in for DEADLINE_EXCEEDED error', done => {
+      // The timeout is 2 seconds, but the error is received after 3 seconds
+      // so the client doesn't retry because more than 2 seconds have elapsed.
+      const requestSpy = (table.bigtable.request = sinon.spy(() => {
+        const stream = new PassThrough({
+          objectMode: true,
+        });
+        (stream as any).abort = () => {};
+        setTimeout(() => {
+          const error = new Error('retry me!') as ServiceError;
+          error.code = 4;
+          stream.emit('error', error);
+        }, 3000);
+        return stream;
+      }));
+      const stream = table.createReadStream({gaxOptions: {timeout: 2000}});
+      stream.on('error', (error: ServiceError) => {
+        assert.strictEqual(error.code, 4);
+        assert.strictEqual(error.message, 'retry me!');
+        assert.strictEqual(requestSpy.callCount, 1); // Ensures the client has not retried.
+        done();
+      });
+    });
     describe('retries', () => {
       let callCreateReadStream: Function;
       let emitters: EventEmitter[] | null; // = [((stream: Writable) => { stream.push([{ key: 'a' }]);
@@ -1117,11 +1245,25 @@ describe('Bigtable/Table', () => {
       let reqOptsCalls: any[];
       let setTimeoutSpy: sinon.SinonSpy;
 
+      /*
+        setImmediate is required here to correctly mock events as they will
+        come in from the request function. It is required for tests to pass,
+        but it is not a problem that it is required because we never expect
+        a single Node event to emit data and then emit an error. That is,
+        a mock without setImmediate around the last error represents a scenario
+        that will never happen.
+       */
+      function emitRetriableError(stream: Duplex) {
+        setImmediate(() => {
+          stream.emit('error', makeRetryableError());
+        });
+      }
+
       beforeEach(() => {
         FakeChunkTransformer.prototype._transform = function (
           rows: Row[],
           enc: {},
-          next: Function
+          next: Function,
         ) {
           rows.forEach(row => this.push(row));
           this.lastRowKey = rows[rows.length - 1].key;
@@ -1161,7 +1303,7 @@ describe('Bigtable/Table', () => {
               range.end = (end as any).value || end;
             }
             return range;
-          }
+          },
         );
 
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1187,7 +1329,6 @@ describe('Bigtable/Table', () => {
           (stream as any).abort = () => {};
 
           setImmediate(() => {
-            stream.emit('request');
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             (emitters!.shift() as any)(stream);
           });
@@ -1221,7 +1362,7 @@ describe('Bigtable/Table', () => {
         emitters = [
           ((stream: Writable) => {
             const cancelledError = new Error(
-              'do not retry me!'
+              'do not retry me!',
             ) as ServiceError;
             cancelledError.code = 1;
             stream.emit('error', cancelledError);
@@ -1262,16 +1403,19 @@ describe('Bigtable/Table', () => {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           ((stream: any) => {
             stream.push([{key: 'a'}]);
-            stream.emit('error', makeRetryableError());
+            emitRetriableError(stream);
           }) as {} as EventEmitter,
           ((stream: Writable) => {
             stream.end();
           }) as {} as EventEmitter,
         ];
 
+        const fullScan = {rowKeys: [], rowRanges: [{}]};
+
         callCreateReadStream(null, () => {
-          assert.strictEqual(reqOptsCalls[0].rows, undefined);
+          assert.deepStrictEqual(reqOptsCalls[0].rows, fullScan);
           assert.deepStrictEqual(reqOptsCalls[1].rows, {
+            rowKeys: [],
             rowRanges: [{start: 'a', startInclusive: false}],
           });
           done();
@@ -1282,7 +1426,7 @@ describe('Bigtable/Table', () => {
         emitters = [
           ((stream: Duplex) => {
             stream.push([{key: 'a'}]);
-            stream.emit('error', makeRetryableError());
+            emitRetriableError(stream);
           }) as {} as EventEmitter,
           ((stream: Writable) => {
             stream.end();
@@ -1291,9 +1435,11 @@ describe('Bigtable/Table', () => {
 
         callCreateReadStream({ranges: [{start: 'a'}]}, () => {
           assert.deepStrictEqual(reqOptsCalls[0].rows, {
+            rowKeys: [],
             rowRanges: [{start: 'a', startInclusive: true}],
           });
           assert.deepStrictEqual(reqOptsCalls[1].rows, {
+            rowKeys: [],
             rowRanges: [{start: 'a', startInclusive: false}],
           });
           done();
@@ -1305,7 +1451,7 @@ describe('Bigtable/Table', () => {
           ((stream: Duplex) => {
             stream.push([{key: 'a'}]);
             stream.push([{key: 'b'}]);
-            stream.emit('error', makeRetryableError());
+            emitRetriableError(stream);
           }) as {} as EventEmitter,
           ((stream: Duplex) => {
             stream.push([{key: 'c'}]);
@@ -1323,9 +1469,11 @@ describe('Bigtable/Table', () => {
             {start: 'c', startInclusive: true},
           ];
           assert.deepStrictEqual(reqOptsCalls[0].rows, {
+            rowKeys: [],
             rowRanges: allRanges,
           });
           assert.deepStrictEqual(reqOptsCalls[1].rows, {
+            rowKeys: [],
             rowRanges: allRanges.slice(1),
           });
           done();
@@ -1336,7 +1484,7 @@ describe('Bigtable/Table', () => {
         emitters = [
           ((stream: Duplex) => {
             stream.push([{key: 'a'}]);
-            stream.emit('error', makeRetryableError());
+            emitRetriableError(stream);
           }) as {} as EventEmitter,
           ((stream: Duplex) => {
             stream.end([{key: 'c'}]);
@@ -1350,21 +1498,100 @@ describe('Bigtable/Table', () => {
         });
       });
 
-      it('should remove `keys` if they were all read', done => {
+      it('should not retry if limit is reached', done => {
         emitters = [
           ((stream: Duplex) => {
             stream.push([{key: 'a'}]);
-            stream.emit('error', makeRetryableError());
+            stream.push([{key: 'b'}]);
+            emitRetriableError(stream);
           }) as {} as EventEmitter,
+        ];
+
+        const options = {
+          ranges: [{start: 'a', end: 'c'}],
+          limit: 2,
+        };
+
+        callCreateReadStream(options, () => {
+          assert.strictEqual(reqOptsCalls.length, 1);
+          done();
+        });
+      });
+
+      it('should not retry if all the keys are read', done => {
+        emitters = [
           ((stream: Duplex) => {
-            stream.push([{key: 'c'}]);
-            stream.end();
+            stream.push([{key: 'a'}]);
+            emitRetriableError(stream);
           }) as {} as EventEmitter,
         ];
 
         callCreateReadStream({keys: ['a']}, () => {
-          assert.strictEqual(reqOptsCalls[0].rows.rowKeys.length, 1);
-          assert.strictEqual(reqOptsCalls[1].rows.rowKeys, undefined);
+          assert.strictEqual(reqOptsCalls.length, 1);
+          done();
+        });
+      });
+
+      it('shouldn not retry if all the ranges are read', done => {
+        emitters = [
+          ((stream: Duplex) => {
+            stream.push([{key: 'c'}]);
+            emitRetriableError(stream);
+          }) as {} as EventEmitter,
+        ];
+
+        const options = {
+          ranges: [{start: 'a', end: 'c', endInclusive: true}],
+        };
+
+        callCreateReadStream(options, () => {
+          assert.strictEqual(reqOptsCalls.length, 1);
+          assert.deepStrictEqual(reqOptsCalls[0].rows, {
+            rowKeys: [],
+            rowRanges: [{start: 'a', end: 'c', startInclusive: true}],
+          });
+          done();
+        });
+      });
+
+      it('shouldn not retry with keys and ranges that are read', done => {
+        emitters = [
+          ((stream: Duplex) => {
+            stream.push([{key: 'a1'}]);
+            stream.push([{key: 'd'}]);
+            emitRetriableError(stream);
+          }) as {} as EventEmitter,
+        ];
+
+        const options = {
+          ranges: [{start: 'a', end: 'b'}],
+          keys: ['c', 'd'],
+        };
+
+        callCreateReadStream(options, () => {
+          assert.strictEqual(reqOptsCalls.length, 1);
+          done();
+        });
+      });
+
+      it('should retry received rst stream errors', done => {
+        const rstStreamError = new Error('Received Rst_stream') as ServiceError;
+        rstStreamError.code = 13;
+        emitters = [
+          ((stream: Duplex) => {
+            stream.emit('error', rstStreamError);
+          }) as {} as EventEmitter,
+          ((stream: Duplex) => {
+            stream.end([{key: 'a'}]);
+          }) as {} as EventEmitter,
+        ];
+
+        const options = {
+          keys: ['a'],
+        };
+
+        callCreateReadStream(options, () => {
+          assert.strictEqual(reqOptsCalls.length, 2);
           done();
         });
       });
@@ -1435,7 +1662,7 @@ describe('Bigtable/Table', () => {
       const fakePrefix = 'b';
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const spy = ((FakeMutation as any).convertToBytes = sinon.spy(
-        () => fakePrefix
+        () => fakePrefix,
       ));
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1675,7 +1902,7 @@ describe('Bigtable/Table', () => {
         assert.strictEqual(config.gaxOpts, gaxOptions);
         assert.strictEqual(
           config.reqOpts.options.requestedPolicyVersion,
-          requestedPolicyVersion
+          requestedPolicyVersion,
         );
         done();
       };
@@ -1747,7 +1974,7 @@ describe('Bigtable/Table', () => {
           assert.strictEqual(clusterStates.get('cluster1'), 'READY');
           assert.strictEqual(clusterStates.get('cluster2'), 'INITIALIZING');
           done();
-        }
+        },
       );
     });
   });
@@ -2144,13 +2371,14 @@ describe('Bigtable/Table', () => {
 
   describe('getRows', () => {
     describe('success', () => {
+      let createReadStreamInternal: SinonSpy<[], PassThrough>;
       const fakeRows = [
         {key: 'c', data: {}},
         {key: 'd', data: {}},
       ];
 
       beforeEach(() => {
-        table.createReadStream = sinon.spy(() => {
+        createReadStreamInternal = sinon.spy(() => {
           const stream = new PassThrough({
             objectMode: true,
           });
@@ -2165,6 +2393,17 @@ describe('Bigtable/Table', () => {
 
           return stream;
         });
+        Table = getTableMock(createReadStreamInternal);
+        INSTANCE = {
+          bigtable: {
+            _metricsConfigManager: new FakeMetricsConfigManager(
+              [],
+            ) as ClientSideMetricsConfigManager,
+          } as Bigtable,
+          name: 'a/b/c/d',
+        } as inst.Instance;
+        TABLE_NAME = INSTANCE.name + '/tables/' + TABLE_ID;
+        table = new Table(INSTANCE, TABLE_ID);
       });
 
       it('should return the rows to the callback', done => {
@@ -2175,8 +2414,8 @@ describe('Bigtable/Table', () => {
           assert.deepStrictEqual(rows, fakeRows);
 
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const spy = (table as any).createReadStream.getCall(0);
-          assert.strictEqual(spy.args[0], options);
+          const spy = createReadStreamInternal.getCall(0);
+          assert.strictEqual((spy.args as any)[2], options);
           done();
         });
       });
@@ -2191,10 +2430,11 @@ describe('Bigtable/Table', () => {
     });
 
     describe('error', () => {
+      let createReadStreamInternal: SinonSpy<[], PassThrough>;
       const error = new Error('err');
 
       beforeEach(() => {
-        table.createReadStream = sinon.spy(() => {
+        createReadStreamInternal = sinon.spy(() => {
           const stream = new PassThrough({
             objectMode: true,
           });
@@ -2205,6 +2445,17 @@ describe('Bigtable/Table', () => {
 
           return stream;
         });
+        Table = getTableMock(createReadStreamInternal);
+        INSTANCE = {
+          bigtable: {
+            _metricsConfigManager: new FakeMetricsConfigManager(
+              [],
+            ) as ClientSideMetricsConfigManager,
+          } as Bigtable,
+          name: 'a/b/c/d',
+        } as inst.Instance;
+        TABLE_NAME = INSTANCE.name + '/tables/' + TABLE_ID;
+        table = new Table(INSTANCE, TABLE_ID);
       });
 
       it('should return the error to the callback', done => {
@@ -2313,7 +2564,7 @@ describe('Bigtable/Table', () => {
       bigtableInstance.request = (config: any) => {
         assert.strictEqual(
           config.reqOpts.appProfileId,
-          bigtableInstance.appProfileId
+          bigtableInstance.appProfileId,
         );
         done();
       };
@@ -2372,7 +2623,6 @@ describe('Bigtable/Table', () => {
             });
 
             setImmediate(() => {
-              stream.emit('request');
               stream.emit('error', error);
             });
 
@@ -2395,17 +2645,17 @@ describe('Bigtable/Table', () => {
             index: 0,
             status: {
               code: 1,
+              message: 'CANCELLED',
             },
           },
           {
             index: 1,
             status: {
-              code: 1,
+              code: 3,
+              message: 'INVALID_ARGUMENT',
             },
           },
         ];
-
-        const parsedStatuses = [{} as DecoratedStatus, {} as DecoratedStatus];
 
         beforeEach(() => {
           table.bigtable.request = () => {
@@ -2416,32 +2666,31 @@ describe('Bigtable/Table', () => {
             });
             return stream;
           };
-
-          let statusCount = 0;
-          sandbox.stub(ds, 'decorateStatus').callsFake(status => {
-            assert.strictEqual(status, fakeStatuses[statusCount].status);
-            return parsedStatuses[statusCount++];
-          });
         });
 
         it('should return a PartialFailureError', done => {
-          table.mutate(entries, (err: Error) => {
+          const newEntries = [
+            {
+              key: 'a',
+            },
+            {
+              key: 'b',
+            },
+          ];
+          table.mutate(newEntries, (err: Error) => {
             assert.strictEqual(err.name, 'PartialFailureError');
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             assert.deepStrictEqual((err as any).errors, [
-              Object.assign(
-                {
-                  entry: entries[0],
-                },
-                parsedStatuses[0]
-              ),
-
-              Object.assign(
-                {
-                  entry: entries[1],
-                },
-                parsedStatuses[1]
-              ),
+              Object.assign({
+                entry: newEntries[0],
+                code: fakeStatuses[0].status.code,
+                message: fakeStatuses[0].status.message,
+              }),
+              Object.assign({
+                entry: newEntries[1],
+                code: fakeStatuses[1].status.code,
+                message: fakeStatuses[1].status.message,
+              }),
             ]);
 
             done();
@@ -2471,7 +2720,6 @@ describe('Bigtable/Table', () => {
           });
 
           setImmediate(() => {
-            stream.emit('request');
             stream.end({entries: fakeStatuses});
           });
 
@@ -2490,6 +2738,7 @@ describe('Bigtable/Table', () => {
       let fakeStatuses: any;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       let entryRequests: any;
+      const requestArgs: RequestOptions[] = [];
 
       beforeEach(() => {
         entryRequests = [];
@@ -2517,21 +2766,39 @@ describe('Bigtable/Table', () => {
             },
           ],
         ];
-        sandbox.stub(ds, 'decorateStatus').returns({} as DecoratedStatus);
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         table.bigtable.request = (config: any) => {
+          requestArgs.push(JSON.parse(JSON.stringify(config)));
           entryRequests.push(config.reqOpts.entries);
           const stream = new PassThrough({
             objectMode: true,
           });
 
           setImmediate(() => {
-            stream.emit('request');
             stream.end({entries: fakeStatuses.shift()});
           });
 
           return stream;
         };
+      });
+
+      it('should send attempt header', done => {
+        table.mutate(entries, () => {
+          assert.strictEqual(requestArgs.length, 2);
+          assert.strictEqual(
+            (requestArgs[0].gaxOpts as any)['otherArgs']['headers'][
+              'bigtable-attempt'
+            ],
+            0,
+          );
+          assert.strictEqual(
+            (requestArgs[1].gaxOpts as any)['otherArgs']['headers'][
+              'bigtable-attempt'
+            ],
+            1,
+          );
+          done();
+        });
       });
 
       it('should succeed after a retry', done => {
@@ -2545,6 +2812,170 @@ describe('Bigtable/Table', () => {
           assert.strictEqual(entryRequests[0].length, 2);
           assert.strictEqual(entryRequests[1].length, 1);
           assert.strictEqual(entryRequests[0][1], entryRequests[1][0]);
+          done();
+        });
+      });
+    });
+
+    describe('rpc level retries', () => {
+      let emitters: EventEmitter[]; // = [((stream: Writable) => { stream.push([{ key: 'a' }]);
+      let requestArgs: RequestOptions[] = [];
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let entryRequests: any;
+
+      beforeEach(() => {
+        emitters = []; // This needs to be assigned in each test case.
+
+        requestArgs = [];
+        entryRequests = [];
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        table.bigtable.request = (config: any) => {
+          requestArgs.push(JSON.parse(JSON.stringify(config)));
+          entryRequests.push(config.reqOpts.entries);
+          const stream = new PassThrough({
+            objectMode: true,
+          });
+
+          setImmediate(() => {
+            (emitters!.shift() as any)(stream);
+          });
+
+          return stream;
+        };
+      });
+
+      it('should send back errors for each pending entry', done => {
+        const mutateEntries = [
+          {
+            key: 'a',
+            method: 'insert',
+            data: {},
+          },
+          {
+            key: 'b',
+            method: 'insert',
+            data: {},
+          },
+        ];
+        const unretriableError = new Error('not retryable') as ServiceError;
+        unretriableError.code = 3; // INVALID_ARGUMENT
+        emitters = [
+          ((stream: Writable) => {
+            stream.emit('data', {
+              entries: [
+                {
+                  index: 0,
+                  status: {
+                    details: [],
+                    code: 0,
+                    message: 'Received data',
+                  },
+                },
+              ],
+            });
+            stream.emit('error', unretriableError);
+          }) as {} as EventEmitter,
+        ];
+        table.maxRetries = 3;
+        table.mutate(
+          mutateEntries,
+          (err: ServiceError & {errors?: ServiceError[]}) => {
+            try {
+              assert.strictEqual(err.code, 3);
+              assert.strictEqual(err.message, 'not retryable');
+              assert(err.errors);
+              assert.strictEqual(err.errors.length, 1);
+              assert.strictEqual(err.errors[0].code, 3);
+              assert.strictEqual(err.errors[0].message, 'not retryable');
+              done();
+            } catch (e) {
+              done(e);
+            }
+          },
+        );
+      });
+      it('should not retry unretriable errors', done => {
+        const unretriableError = new Error('not retryable') as ServiceError;
+        unretriableError.code = 3; // INVALID_ARGUMENT
+        emitters = [
+          ((stream: Writable) => {
+            stream.emit('error', unretriableError);
+          }) as {} as EventEmitter,
+        ];
+        table.maxRetries = 1;
+        table.mutate(entries, () => {
+          assert.strictEqual(entryRequests.length, 1);
+          done();
+        });
+      });
+
+      it('should retry retryable errors', done => {
+        const error = new Error('retryable') as ServiceError;
+        error.code = 14; // Unavailable
+        emitters = [
+          ((stream: Writable) => {
+            stream.emit('error', error);
+          }) as {} as EventEmitter,
+          ((stream: Writable) => {
+            stream.end();
+          }) as {} as EventEmitter,
+        ];
+        table.maxRetries = 1;
+        table.mutate(entries, () => {
+          assert.strictEqual(entryRequests.length, 2);
+          done();
+        });
+      });
+
+      it('should not retry more than maxRetries times', done => {
+        const error = new Error('retryable') as ServiceError;
+        error.code = 14; // Unavailable
+        emitters = [
+          ((stream: Writable) => {
+            stream.emit('error', error);
+          }) as {} as EventEmitter,
+          ((stream: Writable) => {
+            stream.emit('error', error);
+          }) as {} as EventEmitter,
+          ((stream: Writable) => {
+            stream.end();
+          }) as {} as EventEmitter,
+        ];
+        table.maxRetries = 1;
+        table.mutate(entries, () => {
+          assert.strictEqual(entryRequests.length, 2);
+          done();
+        });
+      });
+
+      it('should send attempt header', done => {
+        const error = new Error('retryable') as ServiceError;
+        error.code = 14; // Unavailable
+        emitters = [
+          ((stream: Writable) => {
+            stream.emit('error', error);
+          }) as {} as EventEmitter,
+          ((stream: Writable) => {
+            stream.end();
+          }) as {} as EventEmitter,
+        ];
+        table.maxRetries = 1;
+        table.mutate(entries, () => {
+          assert.strictEqual(requestArgs.length, 2);
+          assert.strictEqual(
+            (requestArgs[0].gaxOpts as any)['otherArgs']['headers'][
+              'bigtable-attempt'
+            ],
+            0,
+          );
+          assert.strictEqual(
+            (requestArgs[1].gaxOpts as any)['otherArgs']['headers'][
+              'bigtable-attempt'
+            ],
+            1,
+          );
           done();
         });
       });
@@ -2671,7 +3102,7 @@ describe('Bigtable/Table', () => {
       bigtableInstance.request = (config: any) => {
         assert.strictEqual(
           config.reqOpts.appProfileId,
-          bigtableInstance.appProfileId
+          bigtableInstance.appProfileId,
         );
         done();
       };
@@ -2830,7 +3261,7 @@ describe('Bigtable/Table', () => {
       table.bigtable.request = (config: any) => {
         assert.deepStrictEqual(
           config.reqOpts.policy.etag,
-          Buffer.from(policy.etag)
+          Buffer.from(policy.etag),
         );
         done();
       };
@@ -2905,7 +3336,7 @@ describe('Bigtable/Table', () => {
           assert.strictEqual(Array.isArray(permissions), true);
           assert.deepStrictEqual(permissions, testPermissions);
           done();
-        }
+        },
       );
     });
 

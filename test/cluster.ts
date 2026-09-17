@@ -19,6 +19,17 @@ import * as proxyquire from 'proxyquire';
 import {PassThrough, Readable} from 'stream';
 import {CallOptions} from 'google-gax';
 import {PreciseDate} from '@google-cloud/precise-date';
+import {ClusterUtils} from '../src/utils/cluster';
+import {InstanceOptions, RequestOptions} from '../src';
+import {createClusterOptionsList} from './constants/cluster';
+import * as snapshot from 'snap-shot-it';
+
+export interface Options {
+  nodes?: Number;
+  gaxOptions?: {
+    timeout: number;
+  };
+}
 
 let promisified = false;
 const fakePromisify = Object.assign({}, promisify, {
@@ -106,7 +117,7 @@ describe('Bigtable/Cluster', () => {
   });
 
   describe('getLocation_', () => {
-    const LOCATION = 'us-central1-b';
+    const LOCATION = 'us-central2-d';
 
     it('should format the location name', () => {
       const expected = `projects/${PROJECT_ID}/locations/${LOCATION}`;
@@ -117,7 +128,7 @@ describe('Bigtable/Cluster', () => {
     it('should format the location name for project name with /', () => {
       const PROJECT_NAME = 'projects/grape-spaceship-123';
       const expected = `projects/${PROJECT_NAME.split(
-        '/'
+        '/',
       ).pop()}/locations/${LOCATION}`;
       const formatted = Cluster.getLocation_(PROJECT_NAME, LOCATION);
       assert.strictEqual(formatted, expected);
@@ -172,7 +183,7 @@ describe('Bigtable/Cluster', () => {
       cluster.instance.createCluster = (
         id: string,
         options_: {},
-        callback: Function
+        callback: Function,
       ) => {
         assert.strictEqual(id, cluster.id);
         assert.strictEqual(options_, options);
@@ -186,7 +197,7 @@ describe('Bigtable/Cluster', () => {
       cluster.instance.createCluster = (
         id: string,
         options: {},
-        callback: Function
+        callback: Function,
       ) => {
         assert.deepStrictEqual(options, {});
         callback(); // done()
@@ -229,7 +240,7 @@ describe('Bigtable/Cluster', () => {
         {
           table,
         },
-        assert.ifError
+        assert.ifError,
       );
     });
 
@@ -249,7 +260,7 @@ describe('Bigtable/Cluster', () => {
         {
           table,
         },
-        assert.ifError
+        assert.ifError,
       );
     });
 
@@ -267,7 +278,7 @@ describe('Bigtable/Cluster', () => {
         {
           table,
         },
-        assert.ifError
+        assert.ifError,
       );
     });
 
@@ -278,7 +289,7 @@ describe('Bigtable/Cluster', () => {
       cluster.bigtable.request = (config: any) => {
         assert.deepStrictEqual(
           config.reqOpts.backup.expireTime,
-          new PreciseDate(expireTime).toStruct()
+          new PreciseDate(expireTime).toStruct(),
         );
         done();
       };
@@ -289,7 +300,7 @@ describe('Bigtable/Cluster', () => {
           table: 'table-id',
           expireTime,
         },
-        assert.ifError
+        assert.ifError,
       );
     });
 
@@ -319,7 +330,7 @@ describe('Bigtable/Cluster', () => {
           table,
           configProperty: true,
         },
-        assert.ifError
+        assert.ifError,
       );
     });
 
@@ -339,7 +350,7 @@ describe('Bigtable/Cluster', () => {
           table,
           gaxOptions,
         },
-        assert.ifError
+        assert.ifError,
       );
     });
 
@@ -359,7 +370,7 @@ describe('Bigtable/Cluster', () => {
           table,
           gaxOptions,
         },
-        assert.ifError
+        assert.ifError,
       );
     });
 
@@ -382,7 +393,7 @@ describe('Bigtable/Cluster', () => {
           assert.strictEqual(backup, undefined);
           assert.deepStrictEqual(Array.from(_args), args);
           done();
-        }
+        },
       );
     });
 
@@ -411,7 +422,7 @@ describe('Bigtable/Cluster', () => {
           assert.strictEqual(backup, backupInstance);
           assert.deepStrictEqual(Array.from(_args), args);
           done();
-        }
+        },
       );
     });
   });
@@ -592,11 +603,11 @@ describe('Bigtable/Cluster', () => {
       cluster.bigtable.request = (config: any) => {
         assert.strictEqual(
           config.reqOpts.pageSize,
-          options.gaxOptions.pageSize
+          options.gaxOptions.pageSize,
         );
         assert.strictEqual(
           config.reqOpts.pageToken,
-          options.gaxOptions.pageToken
+          options.gaxOptions.pageToken,
         );
         done();
       };
@@ -720,7 +731,7 @@ describe('Bigtable/Cluster', () => {
           assert.strictEqual(nextQuery, null);
           assert.strictEqual(apiResp, apiResponse);
           done();
-        }
+        },
       );
     });
 
@@ -954,16 +965,42 @@ describe('Bigtable/Cluster', () => {
   });
 
   describe('setMetadata', () => {
+    beforeEach(() => {
+      const metadata = {
+        location: 'projects/{{projectId}}/locations/us-east4-b',
+      };
+      cluster.metadata = metadata;
+    });
+
     it('should provide the proper request options', done => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       cluster.bigtable.request = (config: any, callback: Function) => {
         assert.strictEqual(config.client, 'BigtableInstanceAdminClient');
-        assert.strictEqual(config.method, 'updateCluster');
-        assert.strictEqual(config.reqOpts.name, CLUSTER_NAME);
+        assert.strictEqual(config.method, 'partialUpdateCluster');
+        assert.strictEqual(config.reqOpts.cluster.name, CLUSTER_NAME);
         callback(); // done()
       };
 
-      cluster.setMetadata({}, done);
+      cluster.setMetadata({nodes: 2}, done);
+    });
+
+    it('should provide the proper request options asynchronously', async () => {
+      let currentRequestInput = null;
+      (cluster.bigtable.request as Function) = (config: RequestOptions) => {
+        currentRequestInput = config;
+      };
+      for (const options of createClusterOptionsList) {
+        await cluster.setMetadata(options);
+        snapshot({
+          input: {
+            id: cluster.id,
+            options: options,
+          },
+          output: {
+            config: currentRequestInput,
+          },
+        });
+      }
     });
 
     it('should respect the nodes option', done => {
@@ -973,7 +1010,7 @@ describe('Bigtable/Cluster', () => {
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       cluster.bigtable.request = (config: any) => {
-        assert.strictEqual(config.reqOpts.serveNodes, options.nodes);
+        assert.strictEqual(config.reqOpts.cluster.serveNodes, options.nodes);
         done();
       };
 
@@ -987,12 +1024,10 @@ describe('Bigtable/Cluster', () => {
         defaultStorageType: 'exellent_type',
       };
 
-      const expectedReqOpts = Object.assign(
-        {},
-        {name: CLUSTER_NAME, serveNodes: options.nodes},
-        options
+      const expectedReqOpts = ClusterUtils.getRequestFromMetadata(
+        options,
+        CLUSTER_NAME,
       );
-      delete expectedReqOpts.nodes;
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       cluster.bigtable.request = (config: any) => {
@@ -1011,7 +1046,7 @@ describe('Bigtable/Cluster', () => {
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       cluster.bigtable.request = (config: any) => {
-        assert.strictEqual(config.reqOpts.serveNodes, options.nodes);
+        assert.strictEqual(config.reqOpts.cluster.serveNodes, options.nodes);
         assert.strictEqual(config.gaxOpts, gaxOptions);
         done();
       };
@@ -1019,14 +1054,16 @@ describe('Bigtable/Cluster', () => {
       cluster.setMetadata(options, gaxOptions, assert.ifError);
     });
 
+    // eslint-disable-next-line no-restricted-properties
     it('should execute callback with all arguments', done => {
       const args = [{}, {}];
-
       cluster.bigtable.request = (config: {}, callback: Function) => {
         callback(...args);
       };
-
-      cluster.setMetadata({}, (...argsies: Array<{}>) => {
+      const name =
+        'projects/{{projectId}}/instances/fake-instance/clusters/fake-cluster';
+      cluster.name = name;
+      cluster.setMetadata({nodes: 2}, (...argsies: Array<{}>) => {
         assert.deepStrictEqual([].slice.call(argsies), args);
         done();
       });

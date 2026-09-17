@@ -25,6 +25,24 @@ export type ISetCell = btTypes.bigtable.v2.Mutation.ISetCell;
 export type Bytes = string | Buffer;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type Data = any;
+/*
+The Data type is expected to be in the following format:
+{
+  columnFamily1: {
+    column1: Cell,
+    column2: Cell
+  },
+  columnFamily2: {
+    otherColumn1: Cell,
+    otherColumn2: Cell
+  }
+}
+Where the Cell data type has the following structure:
+Uint8Array | string | {
+  value: Uint8Array|string,
+  timestamp: number|Long|string,
+}
+*/
 export interface JsonObj {
   [k: string]: string | JsonObj;
 }
@@ -32,7 +50,7 @@ export type Value = string | number | boolean;
 
 export interface ParsedColumn {
   family: string | null;
-  qualifier: string | null;
+  qualifier: string | null | undefined;
 }
 export interface ConvertFromBytesOptions {
   userOptions?: ConvertFromBytesUserOptions;
@@ -109,9 +127,10 @@ export class Mutation {
    */
   static convertFromBytes(
     bytes: Buffer | string,
-    options?: ConvertFromBytesOptions
+    options?: ConvertFromBytesOptions,
   ): Buffer | Value | string {
-    const buf = bytes instanceof Buffer ? bytes : Buffer.from(bytes, 'base64');
+    const buf =
+      bytes instanceof Buffer ? bytes : Buffer.from(bytes as string, 'base64');
     if (options && options.isPossibleNumber && buf.length === 8) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const num = Long.fromBytes(buf as any).toNumber();
@@ -316,7 +335,7 @@ export class Mutation {
       }
 
       const column = Mutation.parseColumnName(
-        (mutation as MutationSettingsObj).column!
+        (mutation as MutationSettingsObj).column!,
       );
 
       if (!column.qualifier) {
@@ -332,7 +351,7 @@ export class Mutation {
       if ((mutation as MutationSettingsObj).time) {
         timeRange = Mutation.createTimeRange(
           (mutation as MutationSettingsObj).time!.start as Date,
-          (mutation as MutationSettingsObj).time!.end as Date
+          (mutation as MutationSettingsObj).time!.end as Date,
         );
       }
 
@@ -340,7 +359,7 @@ export class Mutation {
         deleteFromColumn: {
           familyName: column.family!,
           columnQualifier: Mutation.convertToBytes(
-            column.qualifier
+            column.qualifier,
           ) as Uint8Array,
           timeRange,
         },
@@ -380,11 +399,19 @@ export class Mutation {
    * @private
    */
   static parseColumnName(columnName: string): ParsedColumn {
-    const parts = columnName.split(':');
+    const colonIdx = columnName.indexOf(':');
+
+    if (colonIdx === -1) {
+      // columnName does not contain ':'
+      return {
+        family: columnName,
+        qualifier: undefined,
+      };
+    }
 
     return {
-      family: parts[0],
-      qualifier: parts[1],
+      family: columnName.slice(0, colonIdx),
+      qualifier: columnName.slice(colonIdx + 1),
     };
   }
 

@@ -14,9 +14,7 @@
 
 import {promisifyAll} from '@google-cloud/promisify';
 import arrify = require('arrify');
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const dotProp = require('dot-prop');
-import {Filter, RawFilter} from './filter';
+import {RawFilter} from './filter';
 import {Mutation, ConvertFromBytesUserOptions, Bytes, Data} from './mutation';
 import {Bigtable} from '.';
 import {
@@ -31,10 +29,18 @@ import {Chunk} from './chunktransformer';
 import {CallOptions} from 'google-gax';
 import {ServiceError} from 'google-gax';
 import {google} from '../protos/protos';
+import {RowDataUtils, RowProperties} from './row-data-utils';
+import {GetRowsOptions, TabularApiSurface} from './tabular-api-surface';
+import {getRowsInternal} from './utils/getRowsInternal';
+import {
+  MethodName,
+  StreamingState,
+} from './client-side-metrics/client-side-metrics-attributes';
+import {mutateInternal} from './utils/mutateInternal';
 
 export interface Rule {
   column: string;
-  append: string;
+  append?: string; // append is optional since `increment` doesn't supply it for instance.
   increment?: number;
 }
 export interface CreateRowOptions {
@@ -58,6 +64,7 @@ export interface Family {
 export interface FilterConfigOption {
   method?: string;
   data?: Data;
+  key?: string;
 }
 export interface FilterConfig {
   gaxOptions?: CallOptions;
@@ -79,50 +86,50 @@ export interface GetRowOptions {
 }
 export type RowExistsCallback = (
   err: ServiceError | null,
-  exists?: boolean
+  exists?: boolean,
 ) => void;
 export type RowExistsResponse = [boolean];
 export type CreateRulesCallback = (
   err: ServiceError | null,
-  apiResponse?: google.bigtable.v2.IReadModifyWriteRowResponse
+  apiResponse?: google.bigtable.v2.IReadModifyWriteRowResponse,
 ) => void;
 export type CreateRulesResponse = [
-  google.bigtable.v2.IReadModifyWriteRowResponse
+  google.bigtable.v2.IReadModifyWriteRowResponse,
 ];
 export type CreateRowCallback = (
   err: ServiceError | PartialFailureError | null,
   row?: Row | null,
-  apiResponse?: google.protobuf.Empty
+  apiResponse?: google.protobuf.Empty,
 ) => void;
 export type CreateRowResponse = [Row, google.protobuf.Empty];
 export type GetRowMetadataCallback = (
   err: RowError | null,
-  apiResponse?: google.bigtable.v2.ReadRowsResponse
+  apiResponse?: google.bigtable.v2.ReadRowsResponse,
 ) => void;
 export type GetRowMetadataResponse = [google.bigtable.v2.ReadRowsResponse];
 export type GetRowCallback<T = Row> = (
   err: RowError | null,
   row?: T,
-  apiResponse?: {}
+  apiResponse?: {},
 ) => void;
 export type GetRowResponse<T = Row> = [T, {}];
 export type FilterCallback = (
   err: ServiceError | null,
   matched?: boolean | null,
-  apiResponse?: google.bigtable.v2.ICheckAndMutateRowResponse
+  apiResponse?: google.bigtable.v2.ICheckAndMutateRowResponse,
 ) => void;
 export type FilterResponse = [
   boolean | null,
-  google.bigtable.v2.ICheckAndMutateRowResponse
+  google.bigtable.v2.ICheckAndMutateRowResponse,
 ];
 export type IncrementCallback = (
   err: ServiceError | null,
   value?: number | null,
-  apiResponse?: google.bigtable.v2.IReadModifyWriteRowResponse
+  apiResponse?: google.bigtable.v2.IReadModifyWriteRowResponse,
 ) => void;
 export type IncrementResponse = [
   number | null,
-  google.bigtable.v2.IReadModifyWriteRowResponse
+  google.bigtable.v2.IReadModifyWriteRowResponse,
 ];
 
 /**
@@ -136,6 +143,18 @@ export class RowError extends Error {
     this.message = `Unknown row: ${row}.`;
     this.code = 404;
   }
+}
+
+/**
+ * getProperties returns the properties needed to make a request for a table.
+ *
+ * @param {Row} row The row to make a request for.
+ */
+function getProperties(row: Row): RowProperties {
+  return {
+    reqOpts: {tableName: row.table.name},
+    requestData: row,
+  };
 }
 
 /**
@@ -156,13 +175,13 @@ export class RowError extends Error {
  */
 export class Row {
   bigtable: Bigtable;
-  table: Table;
+  table: TabularApiSurface;
   id: string;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   data: any;
   key?: string;
   metadata?: {};
-  constructor(table: Table, key: string) {
+  constructor(table: TabularApiSurface, key: string) {
     this.bigtable = table.bigtable;
     this.table = table;
     this.id = key;
@@ -232,7 +251,7 @@ export class Row {
           chunk.qualifier.value as string,
           {
             userOptions: options,
-          }
+          },
         ) as string;
       }
 
@@ -305,34 +324,9 @@ export class Row {
    */
   static formatFamilies_(
     families: google.bigtable.v2.IFamily[],
-    options?: FormatFamiliesOptions
+    options?: FormatFamiliesOptions,
   ) {
-    const data = {} as {[index: string]: {}};
-    options = options || {};
-    families.forEach(family => {
-      const familyData = (data[family.name!] = {}) as {
-        [index: string]: {};
-      };
-      family.columns!.forEach(column => {
-        const qualifier = Mutation.convertFromBytes(
-          column.qualifier as string
-        ) as string;
-        familyData[qualifier] = column.cells!.map(cell => {
-          let value = cell.value;
-          if (options!.decode !== false) {
-            value = Mutation.convertFromBytes(value as Bytes, {
-              isPossibleNumber: true,
-            }) as string;
-          }
-          return {
-            value,
-            timestamp: cell.timestampMicros,
-            labels: cell.labels,
-          };
-        });
-      });
-    });
-    return data;
+    return RowDataUtils.formatFamilies_Util(families, options);
   }
 
   create(options?: CreateRowOptions): Promise<CreateRowResponse>;
@@ -356,7 +350,7 @@ export class Row {
    */
   create(
     optionsOrCallback?: CreateRowOptions | CreateRowCallback,
-    cb?: CreateRowCallback
+    cb?: CreateRowCallback,
   ): void | Promise<CreateRowResponse> {
     const options =
       typeof optionsOrCallback === 'object' ? optionsOrCallback : {};
@@ -377,18 +371,18 @@ export class Row {
           return;
         }
         callback(null, this, apiResponse);
-      }
+      },
     );
   }
 
   createRules(
     rules: Rule | Rule[],
-    options?: CallOptions
+    options?: CallOptions,
   ): Promise<CreateRulesResponse>;
   createRules(
     rules: Rule | Rule[],
     options: CallOptions,
-    callback: CreateRulesCallback
+    callback: CreateRulesCallback,
   ): void;
   createRules(rules: Rule | Rule[], callback: CreateRulesCallback): void;
   /**
@@ -412,51 +406,13 @@ export class Row {
   createRules(
     rules: Rule | Rule[],
     optionsOrCallback?: CallOptions | CreateRulesCallback,
-    cb?: CreateRulesCallback
+    cb?: CreateRulesCallback,
   ): void | Promise<CreateRulesResponse> {
-    const gaxOptions =
-      typeof optionsOrCallback === 'object' ? optionsOrCallback : {};
-    const callback =
-      typeof optionsOrCallback === 'function' ? optionsOrCallback : cb!;
-
-    if (!rules || (rules as Rule[]).length === 0) {
-      throw new Error('At least one rule must be provided.');
-    }
-
-    rules = arrify(rules).map(rule => {
-      const column = Mutation.parseColumnName(rule.column);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const ruleData: any = {
-        familyName: column.family,
-        columnQualifier: Mutation.convertToBytes(column.qualifier!),
-      };
-
-      if (rule.append) {
-        ruleData.appendValue = Mutation.convertToBytes(rule.append);
-      }
-
-      if (rule.increment) {
-        ruleData.incrementAmount = rule.increment;
-      }
-
-      return ruleData;
-    });
-
-    const reqOpts = {
-      tableName: this.table.name,
-      appProfileId: this.bigtable.appProfileId,
-      rowKey: Mutation.convertToBytes(this.id),
+    RowDataUtils.createRulesUtil(
       rules,
-    };
-    this.data = {};
-    this.bigtable.request<google.bigtable.v2.IReadModifyWriteRowResponse>(
-      {
-        client: 'BigtableClient',
-        method: 'readModifyWriteRow',
-        reqOpts,
-        gaxOpts: gaxOptions,
-      },
-      callback
+      getProperties(this),
+      optionsOrCallback,
+      cb,
     );
   }
 
@@ -478,7 +434,7 @@ export class Row {
    */
   delete(
     optionsOrCallback?: CallOptions | MutateCallback,
-    cb?: MutateCallback
+    cb?: MutateCallback,
   ): void | Promise<MutateResponse> {
     const gaxOptions =
       typeof optionsOrCallback === 'object' ? optionsOrCallback : {};
@@ -494,12 +450,12 @@ export class Row {
 
   deleteCells(
     columns: string[],
-    options?: CallOptions
+    options?: CallOptions,
   ): Promise<MutateResponse>;
   deleteCells(
     columns: string[],
     options: CallOptions,
-    callback: MutateCallback
+    callback: MutateCallback,
   ): void;
   deleteCells(columns: string[], callback: MutateCallback): void;
   /**
@@ -519,7 +475,7 @@ export class Row {
   deleteCells(
     columns: string[],
     optionsOrCallback?: CallOptions | MutateCallback,
-    cb?: MutateCallback
+    cb?: MutateCallback,
   ): void | Promise<MutateResponse> {
     const gaxOptions =
       typeof optionsOrCallback === 'object' ? optionsOrCallback : {};
@@ -552,7 +508,7 @@ export class Row {
    */
   exists(
     optionsOrCallback?: CallOptions | RowExistsCallback,
-    cb?: RowExistsCallback
+    cb?: RowExistsCallback,
   ): void | Promise<RowExistsResponse> {
     const gaxOptions =
       typeof optionsOrCallback === 'object' ? optionsOrCallback : {};
@@ -573,7 +529,7 @@ export class Row {
           },
         ],
       },
-      gaxOptions
+      gaxOptions,
     );
     this.getMetadata(options as GetRowOptions, err => {
       if (err) {
@@ -592,7 +548,7 @@ export class Row {
   filter(
     filter: RawFilter,
     config: FilterConfig,
-    callback: FilterCallback
+    callback: FilterCallback,
   ): void;
   filter(filter: RawFilter, callback: FilterCallback): void;
   /**
@@ -619,56 +575,22 @@ export class Row {
   filter(
     filter: RawFilter,
     configOrCallback?: FilterConfig | FilterCallback,
-    cb?: FilterCallback
+    cb?: FilterCallback,
   ): void | Promise<FilterResponse> {
-    const config = typeof configOrCallback === 'object' ? configOrCallback : {};
-    const callback =
-      typeof configOrCallback === 'function' ? configOrCallback : cb!;
-    const reqOpts = {
-      tableName: this.table.name,
-      appProfileId: this.bigtable.appProfileId,
-      rowKey: Mutation.convertToBytes(this.id),
-      predicateFilter: Filter.parse(filter),
-      trueMutations: createFlatMutationsList(config.onMatch!),
-      falseMutations: createFlatMutationsList(config.onNoMatch!),
-    };
-    this.data = {};
-    this.bigtable.request<google.bigtable.v2.ICheckAndMutateRowResponse>(
-      {
-        client: 'BigtableClient',
-        method: 'checkAndMutateRow',
-        reqOpts,
-        gaxOpts: config.gaxOptions,
-      },
-      (err, apiResponse) => {
-        if (err) {
-          callback(err, null, apiResponse);
-          return;
-        }
-
-        callback(null, apiResponse!.predicateMatched, apiResponse);
-      }
-    );
-
-    function createFlatMutationsList(entries: FilterConfigOption[]) {
-      const e2 = arrify(entries).map(
-        entry => Mutation.parse(entry as Mutation).mutations!
-      );
-      return e2.reduce((a, b) => a.concat(b), []);
-    }
+    RowDataUtils.filterUtil(filter, getProperties(this), configOrCallback, cb);
   }
 
   get(options?: GetRowOptions): Promise<GetRowResponse<Row>>;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   get<T = any>(
     columns: string[],
-    options?: GetRowOptions
+    options?: GetRowOptions,
   ): Promise<GetRowResponse<T>>;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   get<T = any>(
     columns: string[],
     options: GetRowOptions,
-    callback: GetRowCallback<T>
+    callback: GetRowCallback<T>,
   ): void;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   get<T = any>(columns: string[], callback: GetRowCallback<T>): void;
@@ -695,7 +617,7 @@ export class Row {
   get<T = any | Row>(
     columnsOrOptionsOrCallback?: string[] | GetRowOptions | GetRowCallback<T>,
     optionsOrCallback?: GetRowOptions | GetRowCallback<T>,
-    cb?: GetRowCallback<T>
+    cb?: GetRowCallback<T>,
   ): void | Promise<GetRowResponse> {
     let columns = Array.isArray(columnsOrOptionsOrCallback)
       ? columnsOrOptionsOrCallback
@@ -705,14 +627,14 @@ export class Row {
       !Array.isArray(columnsOrOptionsOrCallback)
         ? columnsOrOptionsOrCallback
         : typeof optionsOrCallback === 'object'
-        ? optionsOrCallback
-        : {};
+          ? optionsOrCallback
+          : {};
     const callback =
       typeof columnsOrOptionsOrCallback === 'function'
         ? columnsOrOptionsOrCallback
         : typeof optionsOrCallback === 'function'
-        ? optionsOrCallback
-        : cb!;
+          ? optionsOrCallback
+          : cb!;
 
     let filter;
     columns = arrify(columns);
@@ -745,36 +667,48 @@ export class Row {
       filter = arrify(filter).concat(options.filter);
     }
 
-    const getRowsOptions = Object.assign({}, options, {
+    const getRowsOptions: GetRowsOptions = Object.assign({}, options, {
       keys: [this.id],
       filter,
+      limit: 1,
     });
 
-    this.table.getRows(getRowsOptions, (err, rows) => {
-      if (err) {
-        callback(err);
-        return;
-      }
+    const metricsCollector =
+      this.table.bigtable._metricsConfigManager.createOperation(
+        MethodName.READ_ROW,
+        StreamingState.UNARY,
+        this.table,
+      );
+    void getRowsInternal(
+      this.table,
+      metricsCollector,
+      getRowsOptions,
+      (err, rows) => {
+        if (err) {
+          callback(err);
+          return;
+        }
 
-      const row = rows![0];
+        const row = rows![0];
 
-      if (!row) {
-        const e = new RowError(this.id);
-        callback(e);
-        return;
-      }
+        if (!row) {
+          const e = new RowError(this.id);
+          callback(e);
+          return;
+        }
 
-      this.data = row.data;
+        this.data = row.data;
 
-      // If the user specifies column names, we'll return back the row data
-      // we received. Otherwise, we'll return the row "this" in a typical
-      // GrpcServiceObject#get fashion.
-      if (columns.length > 0) {
-        callback(null, row.data);
-      } else {
-        (callback as {} as GetRowCallback<Row>)(null, this);
-      }
-    });
+        // If the user specifies column names, we'll return back the row data
+        // we received. Otherwise, we'll return the row "this" in a typical
+        // GrpcServiceObject#get fashion.
+        if (columns.length > 0) {
+          callback(null, row.data);
+        } else {
+          (callback as {} as GetRowCallback<Row>)(null, this);
+        }
+      },
+    );
   }
 
   getMetadata(options?: GetRowOptions): Promise<GetRowMetadataResponse>;
@@ -798,7 +732,7 @@ export class Row {
    */
   getMetadata(
     optionsOrCallback?: GetRowOptions | GetRowMetadataCallback,
-    cb?: GetRowMetadataCallback
+    cb?: GetRowMetadataCallback,
   ): void | Promise<GetRowMetadataResponse> {
     const options =
       typeof optionsOrCallback === 'object' ? optionsOrCallback : {};
@@ -817,20 +751,20 @@ export class Row {
   increment(
     column: string,
     value: number,
-    options?: CallOptions
+    options?: CallOptions,
   ): Promise<IncrementResponse>;
   increment(column: string, options?: CallOptions): Promise<IncrementResponse>;
   increment(
     column: string,
     value: number,
     options: CallOptions,
-    callback: IncrementCallback
+    callback: IncrementCallback,
   ): void;
   increment(column: string, value: number, callback: IncrementCallback): void;
   increment(
     column: string,
     options: CallOptions,
-    callback: IncrementCallback
+    callback: IncrementCallback,
   ): void;
   increment(column: string, callback: IncrementCallback): void;
   /**
@@ -854,41 +788,15 @@ export class Row {
     column: string,
     valueOrOptionsOrCallback?: number | CallOptions | IncrementCallback,
     optionsOrCallback?: CallOptions | IncrementCallback,
-    cb?: IncrementCallback
+    cb?: IncrementCallback,
   ): void | Promise<IncrementResponse> {
-    const value =
-      typeof valueOrOptionsOrCallback === 'number'
-        ? valueOrOptionsOrCallback
-        : 1;
-    const gaxOptions =
-      typeof valueOrOptionsOrCallback === 'object'
-        ? valueOrOptionsOrCallback
-        : typeof optionsOrCallback === 'object'
-        ? optionsOrCallback
-        : {};
-    const callback =
-      typeof valueOrOptionsOrCallback === 'function'
-        ? valueOrOptionsOrCallback
-        : typeof optionsOrCallback === 'function'
-        ? optionsOrCallback
-        : cb!;
-
-    const reqOpts = {
+    RowDataUtils.incrementUtils(
       column,
-      increment: value,
-    } as Rule;
-
-    this.createRules(reqOpts, gaxOptions, (err, resp) => {
-      if (err) {
-        callback(err, null, resp);
-        return;
-      }
-
-      const data = Row.formatFamilies_(resp!.row!.families!);
-      const value = dotProp.get(data, column.replace(':', '.'))[0].value;
-
-      callback(null, value, resp);
-    });
+      getProperties(this),
+      valueOrOptionsOrCallback,
+      optionsOrCallback,
+      cb,
+    );
   }
 
   save(entry: Entry, options?: CallOptions): Promise<MutateResponse>;
@@ -912,7 +820,7 @@ export class Row {
   save(
     entry: Entry,
     optionsOrCallback?: CallOptions | MutateCallback,
-    cb?: MutateCallback
+    cb?: MutateCallback,
   ): void | Promise<MutateResponse> {
     const gaxOptions =
       typeof optionsOrCallback === 'object' ? optionsOrCallback : {};
@@ -924,7 +832,19 @@ export class Row {
       method: Mutation.methods.INSERT,
     } as {} as Entry;
     this.data = {};
-    this.table.mutate(mutation, gaxOptions as {} as MutateOptions, callback);
+    const metricsCollector =
+      this.bigtable._metricsConfigManager.createOperation(
+        MethodName.MUTATE_ROW,
+        StreamingState.UNARY,
+        this.table,
+      );
+    mutateInternal(
+      this.table,
+      metricsCollector,
+      mutation,
+      gaxOptions as {} as MutateOptions,
+      callback,
+    );
   }
 }
 

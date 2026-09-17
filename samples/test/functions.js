@@ -29,6 +29,8 @@ const cwd = path.join(__dirname, '..');
 const TABLE_ID = `mobile-time-series-${uuid.v4()}`.substr(0, 30); // Bigtable naming rules
 
 describe('functions', async () => {
+  // The following `obtainTestInstance` line needs to be moved into `before`.
+  // This needs to happen when we get the functions tests running again.
   const instance = await obtainTestInstance();
   const INSTANCE_ID = instance.id;
   let table;
@@ -38,10 +40,20 @@ describe('functions', async () => {
   let ffProc;
 
   before(async () => {
+    const {BigtableTableAdminClient} = require('@google-cloud/bigtable').v2;
+    const adminClient = new BigtableTableAdminClient();
+    const projectId = await adminClient.getProjectId();
+    const request = {
+      parent: `projects/${projectId}/instances/${INSTANCE_ID}`,
+      tableId: TABLE_ID,
+      table: {
+        columnFamilies: {
+          stats_summary: {},
+        },
+      },
+    };
+    await adminClient.createTable(request).catch(console.error);
     table = instance.table(TABLE_ID);
-
-    await table.create().catch(console.error);
-    await table.createFamily('stats_summary').catch(console.error);
 
     const rowsToInsert = [
       {
@@ -148,7 +160,7 @@ describe('functions', async () => {
     // Workaround: include "& sleep <TIMEOUT>; kill $!" in executed command
     ffProc = execSync(
       `functions-framework --target=readRows --signature-type=http --port ${PORT} & sleep 2; kill $!`,
-      {shell: true, cwd}
+      {shell: true, cwd},
     );
   });
 
@@ -177,7 +189,7 @@ rowkey: phone#4c410523#20190502, os_build: PQ2A.190405.004
 rowkey: phone#4c410523#20190505, os_build: PQ2A.190406.000
 rowkey: phone#5c10102#20190501, os_build: PQ2A.190401.002
 rowkey: phone#5c10102#20190502, os_build: PQ2A.190406.000
-`
+`,
     );
   });
 });

@@ -29,7 +29,7 @@ export interface AppProfileOptions {
    * value is required when creating the app profile and optional when setting
    * the metadata.
    */
-  routing?: 'any' | Cluster;
+  routing?: 'any' | Cluster | Set<Cluster> | Set<string>;
   /**
    * Whether or not CheckAndMutateRow and ReadModifyWriteRow requests are
    * allowed by this app profile. It is unsafe to send these requests to the
@@ -68,52 +68,52 @@ export interface DeleteAppProfileOptions {
 export type CreateAppProfileCallback = (
   err: ServiceError | null,
   appProfile?: AppProfile,
-  apiResponse?: google.bigtable.admin.v2.IAppProfile
+  apiResponse?: google.bigtable.admin.v2.IAppProfile,
 ) => void;
 export type CreateAppProfileResponse = [
   AppProfile,
-  google.bigtable.admin.v2.IAppProfile
+  google.bigtable.admin.v2.IAppProfile,
 ];
 export type DeleteAppProfileCallback = (
   err: ServiceError | null,
-  apiResponse?: google.protobuf.Empty
+  apiResponse?: google.protobuf.Empty,
 ) => void;
 export type DeleteAppProfileResponse = [google.protobuf.Empty];
 export type AppProfileExistsCallback = (
   err: ServiceError | null,
-  exists?: boolean
+  exists?: boolean,
 ) => void;
 export type AppProfileExistsResponse = [boolean];
 export type GetAppProfileMetadataCallback = (
   err: ServiceError | null,
   metadata?: google.bigtable.admin.v2.IAppProfile,
-  apiResponse?: google.bigtable.admin.v2.IAppProfile
+  apiResponse?: google.bigtable.admin.v2.IAppProfile,
 ) => void;
 export type GetAppProfileMetadataResponse = [
   google.bigtable.admin.v2.IAppProfile,
-  google.bigtable.admin.v2.IAppProfile
+  google.bigtable.admin.v2.IAppProfile,
 ];
 export type GetAppProfileCallback = (
   err: ServiceError | null,
   appProfile?: AppProfile,
-  apiResponse?: google.bigtable.admin.v2.IAppProfile
+  apiResponse?: google.bigtable.admin.v2.IAppProfile,
 ) => void;
 export type GetAppProfileResponse = [
   AppProfile,
-  google.bigtable.admin.v2.IAppProfile
+  google.bigtable.admin.v2.IAppProfile,
 ];
 export type GetAppProfilesCallback = (
   err: ServiceError | null,
   appProfiles?: AppProfile[],
-  apiResponse?: google.bigtable.admin.v2.IAppProfile[]
+  apiResponse?: google.bigtable.admin.v2.IAppProfile[],
 ) => void;
 export type GetAppProfilesResponse = [
   AppProfile[],
-  google.bigtable.admin.v2.IAppProfile[]
+  google.bigtable.admin.v2.IAppProfile[],
 ];
 export type SetAppProfileMetadataCallback = (
   err: ServiceError | null,
-  apiResponse?: google.protobuf.Empty
+  apiResponse?: google.protobuf.Empty,
 ) => void;
 export type SetAppProfileMetadataResponse = [google.protobuf.Empty];
 
@@ -196,13 +196,30 @@ Please use the format 'my-app-profile' or '${instance.name}/appProfiles/my-app-p
    * ```
    */
   static formatAppProfile_(
-    options: AppProfileOptions
+    options: AppProfileOptions,
   ): google.bigtable.admin.v2.IAppProfile {
     const appProfile: google.bigtable.admin.v2.IAppProfile = {};
 
+    const errMessage =
+      'An app profile routing policy can only contain "any" for multi cluster routing, a `Cluster` for single routing, or a set of clusterIds as strings or `Clusters` for multi cluster routing.';
     if (options.routing) {
       if (options.routing === 'any') {
         appProfile.multiClusterRoutingUseAny = {};
+      } else if (options.routing instanceof Set) {
+        const routingAsArray = [...options.routing];
+        if (isClusterArray(routingAsArray)) {
+          // Runs if routing is a set and every element in it is a cluster
+          appProfile.multiClusterRoutingUseAny = {
+            clusterIds: routingAsArray.map(cluster => cluster.id),
+          };
+        } else if (isStringArray(routingAsArray)) {
+          // Runs if routing is a set and every element in it is a string
+          appProfile.multiClusterRoutingUseAny = {
+            clusterIds: routingAsArray,
+          };
+        } else {
+          throw new Error(errMessage);
+        }
       } else if (options.routing instanceof Cluster) {
         appProfile.singleClusterRouting = {
           clusterId: options.routing.id,
@@ -212,9 +229,7 @@ Please use the format 'my-app-profile' or '${instance.name}/appProfiles/my-app-p
             options.allowTransactionalWrites;
         }
       } else {
-        throw new Error(
-          'An app profile routing policy can only contain "any" or a `Cluster`.'
-        );
+        throw new Error(errMessage);
       }
     }
 
@@ -241,7 +256,7 @@ Please use the format 'my-app-profile' or '${instance.name}/appProfiles/my-app-p
    */
   create(
     optionsOrCallback?: AppProfileOptions | CreateAppProfileCallback,
-    cb?: CreateAppProfileCallback
+    cb?: CreateAppProfileCallback,
   ): void | Promise<CreateAppProfileResponse> {
     const callback =
       typeof optionsOrCallback === 'function' ? optionsOrCallback : cb!;
@@ -253,7 +268,7 @@ Please use the format 'my-app-profile' or '${instance.name}/appProfiles/my-app-p
   delete(options?: DeleteAppProfileOptions): Promise<DeleteAppProfileResponse>;
   delete(
     options: DeleteAppProfileOptions,
-    callback: DeleteAppProfileCallback
+    callback: DeleteAppProfileCallback,
   ): void;
   delete(callback: DeleteAppProfileCallback): void;
   /**
@@ -277,7 +292,7 @@ Please use the format 'my-app-profile' or '${instance.name}/appProfiles/my-app-p
    */
   delete(
     optionsOrCallback?: DeleteAppProfileOptions | DeleteAppProfileCallback,
-    cb?: DeleteAppProfileCallback
+    cb?: DeleteAppProfileCallback,
   ): void | Promise<DeleteAppProfileResponse> {
     const callback =
       typeof optionsOrCallback === 'function' ? optionsOrCallback : cb!;
@@ -299,7 +314,7 @@ Please use the format 'my-app-profile' or '${instance.name}/appProfiles/my-app-p
         reqOpts,
         gaxOpts: options.gaxOptions,
       },
-      callback
+      callback,
     );
   }
 
@@ -324,7 +339,7 @@ Please use the format 'my-app-profile' or '${instance.name}/appProfiles/my-app-p
    */
   exists(
     optionsOrCallback?: CallOptions | AppProfileExistsCallback,
-    cb?: AppProfileExistsCallback
+    cb?: AppProfileExistsCallback,
   ): void | Promise<AppProfileExistsResponse> {
     const callback =
       typeof optionsOrCallback === 'function' ? optionsOrCallback : cb!;
@@ -360,7 +375,7 @@ Please use the format 'my-app-profile' or '${instance.name}/appProfiles/my-app-p
    */
   get(
     optionsOrCallback?: CallOptions | GetAppProfileCallback,
-    cb?: GetAppProfileCallback
+    cb?: GetAppProfileCallback,
   ): void | Promise<GetAppProfileResponse> {
     const callback =
       typeof optionsOrCallback === 'function' ? optionsOrCallback : cb!;
@@ -378,7 +393,7 @@ Please use the format 'my-app-profile' or '${instance.name}/appProfiles/my-app-p
   getMetadata(options?: CallOptions): Promise<GetAppProfileMetadataResponse>;
   getMetadata(
     options: CallOptions,
-    callback: GetAppProfileMetadataCallback
+    callback: GetAppProfileMetadataCallback,
   ): void;
   getMetadata(callback: GetAppProfileMetadataCallback): void;
   /**
@@ -400,7 +415,7 @@ Please use the format 'my-app-profile' or '${instance.name}/appProfiles/my-app-p
    */
   getMetadata(
     optionsOrCallback?: CallOptions | GetAppProfileMetadataCallback,
-    cb?: GetAppProfileMetadataCallback
+    cb?: GetAppProfileMetadataCallback,
   ): void | Promise<GetAppProfileMetadataResponse> {
     const callback =
       typeof optionsOrCallback === 'function' ? optionsOrCallback : cb!;
@@ -420,22 +435,22 @@ Please use the format 'my-app-profile' or '${instance.name}/appProfiles/my-app-p
           this.metadata = resp;
         }
         callback(err, resp, resp);
-      }
+      },
     );
   }
 
   setMetadata(
     metadata: AppProfileOptions,
-    options?: CallOptions
+    options?: CallOptions,
   ): Promise<SetAppProfileMetadataResponse>;
   setMetadata(
     metadata: AppProfileOptions,
     options: CallOptions,
-    callback: SetAppProfileMetadataCallback
+    callback: SetAppProfileMetadataCallback,
   ): void;
   setMetadata(
     metadata: AppProfileOptions,
-    callback: SetAppProfileMetadataCallback
+    callback: SetAppProfileMetadataCallback,
   ): void;
   /**
    * Set the app profile metadata.
@@ -457,7 +472,7 @@ Please use the format 'my-app-profile' or '${instance.name}/appProfiles/my-app-p
   setMetadata(
     metadata: AppProfileOptions,
     optionsOrCallback?: CallOptions | SetAppProfileMetadataCallback,
-    cb?: SetAppProfileMetadataCallback
+    cb?: SetAppProfileMetadataCallback,
   ): void | Promise<SetAppProfileMetadataResponse> {
     const callback =
       typeof optionsOrCallback === 'function' ? optionsOrCallback : cb!;
@@ -493,9 +508,30 @@ Please use the format 'my-app-profile' or '${instance.name}/appProfiles/my-app-p
         reqOpts,
         gaxOpts: gaxOptions,
       },
-      callback
+      callback,
     );
   }
+}
+
+function isStringArray(array: any): array is string[] {
+  return array.every((cluster: any) => {
+    return typeof cluster === 'string';
+  });
+}
+
+function isClusterArray(array: any): array is Cluster[] {
+  return array.every((cluster: any) => {
+    return isCluster(cluster);
+  });
+}
+
+function isCluster(cluster: any): cluster is Cluster {
+  return (
+    (cluster as Cluster).bigtable !== undefined &&
+    (cluster as Cluster).instance !== undefined &&
+    (cluster as Cluster).id !== undefined &&
+    (cluster as Cluster).name !== undefined
+  );
 }
 
 /*! Developer Documentation

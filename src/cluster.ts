@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import {PreciseDate} from '@google-cloud/precise-date';
 import {promisifyAll} from '@google-cloud/promisify';
 import {CallOptions, LROperation, Operation, ServiceError} from 'google-gax';
 
@@ -22,6 +21,7 @@ const pumpify = require('pumpify');
 import {google} from '../protos/protos';
 import {Bigtable} from '.';
 import {Instance} from './instance';
+import {ClusterUtils} from './utils/cluster';
 
 import {
   Backup,
@@ -42,14 +42,14 @@ export interface GenericClusterCallback<T> {
   (
     err?: ServiceError | null,
     cluster?: Cluster | null,
-    apiResponse?: T | null
+    apiResponse?: T | null,
   ): void;
 }
 export interface GenericOperationCallback<T> {
   (
     err?: ServiceError | null,
     operation?: Operation | null,
-    apiResponse?: T | null
+    apiResponse?: T | null,
   ): void;
 }
 
@@ -72,10 +72,14 @@ export type GetClusterCallback = GenericClusterCallback<ICluster>;
 export type GetClustersCallback = (
   err: ServiceError | null,
   clusters?: Cluster[],
-  apiResponse?: google.bigtable.admin.v2.IListClustersResponse
+  apiResponse?: google.bigtable.admin.v2.IListClustersResponse,
 ) => void;
 export interface SetClusterMetadataOptions {
-  nodes: number;
+  nodes?: number;
+  minServeNodes?: number;
+  maxServeNodes?: number;
+  cpuUtilizationPercent?: number;
+  location?: string;
 }
 export type SetClusterMetadataCallback = GenericOperationCallback<
   Operation | null | undefined
@@ -84,12 +88,15 @@ export interface BasicClusterConfig {
   encryption?: google.bigtable.admin.v2.Cluster.IEncryptionConfig;
   key?: string;
   location: string;
-  nodes: number;
+  nodes?: number;
   storage?: string;
+  minServeNodes?: number;
+  maxServeNodes?: number;
+  cpuUtilizationPercent?: number;
 }
 
 export interface CreateBackupConfig extends ModifiableBackupFields {
-  table: string | Table;
+  table?: string | Table;
   gaxOptions?: CallOptions;
 }
 
@@ -97,7 +104,7 @@ export type CreateBackupCallback = (
   err: ServiceError | Error | null,
   backup?: Backup,
   operation?: Operation,
-  apiResponse?: IOperation
+  apiResponse?: IOperation,
 ) => void;
 export type CreateBackupResponse = [Backup, Operation, IOperation];
 
@@ -107,7 +114,7 @@ export interface CreateClusterOptions extends BasicClusterConfig {
 export type GetClusterMetadataCallback = (
   err: ServiceError | null,
   metadata?: ICluster | null,
-  apiResponse?: IOperation | null
+  apiResponse?: IOperation | null,
 ) => void;
 
 /**
@@ -235,7 +242,7 @@ Please use the format 'my-cluster' or '${instance.name}/clusters/my-cluster'.`);
    */
   create(
     optionsOrCallback?: CreateClusterOptions | CreateClusterCallback,
-    cb?: CreateClusterCallback
+    cb?: CreateClusterCallback,
   ): void | Promise<CreateClusterResponse> {
     const callback =
       typeof optionsOrCallback === 'function' ? optionsOrCallback : cb!;
@@ -249,12 +256,12 @@ Please use the format 'my-cluster' or '${instance.name}/clusters/my-cluster'.`);
 
   createBackup(
     id: string,
-    config: CreateBackupConfig
+    config: CreateBackupConfig,
   ): Promise<CreateBackupResponse>;
   createBackup(
     id: string,
     config: CreateBackupConfig,
-    callback: CreateBackupCallback
+    callback: CreateBackupCallback,
   ): void;
   /**
    * Backup a table from this cluster.
@@ -281,7 +288,7 @@ Please use the format 'my-cluster' or '${instance.name}/clusters/my-cluster'.`);
   createBackup(
     id: string,
     config: CreateBackupConfig,
-    callback?: CreateBackupCallback
+    callback?: CreateBackupCallback,
   ): void | Promise<CreateBackupResponse> {
     if (!id) {
       throw new TypeError('An id is required to create a backup.');
@@ -306,11 +313,7 @@ Please use the format 'my-cluster' or '${instance.name}/clusters/my-cluster'.`);
       },
     };
 
-    if (reqOpts.backup.expireTime instanceof Date) {
-      reqOpts.backup.expireTime = new PreciseDate(
-        reqOpts.backup.expireTime
-      ).toStruct();
-    }
+    ClusterUtils.formatBackupExpiryTime(reqOpts.backup);
 
     delete reqOpts.backup.table;
     delete reqOpts.backup.gaxOptions;
@@ -331,7 +334,7 @@ Please use the format 'my-cluster' or '${instance.name}/clusters/my-cluster'.`);
         }
 
         callback!(null, this.backup(id), ...args);
-      }
+      },
     );
   }
 
@@ -354,7 +357,7 @@ Please use the format 'my-cluster' or '${instance.name}/clusters/my-cluster'.`);
    */
   delete(
     gaxOptionsOrCallback?: CallOptions | DeleteClusterCallback,
-    cb?: DeleteClusterCallback
+    cb?: DeleteClusterCallback,
   ): void | Promise<ApiResponse> {
     const callback =
       typeof gaxOptionsOrCallback === 'function' ? gaxOptionsOrCallback : cb!;
@@ -372,7 +375,7 @@ Please use the format 'my-cluster' or '${instance.name}/clusters/my-cluster'.`);
         },
         gaxOpts: gaxOptions,
       },
-      callback
+      callback,
     );
   }
 
@@ -395,7 +398,7 @@ Please use the format 'my-cluster' or '${instance.name}/clusters/my-cluster'.`);
    */
   exists(
     gaxOptionsOrCallback?: CallOptions | ExistsClusterCallback,
-    cb?: ExistsClusterCallback
+    cb?: ExistsClusterCallback,
   ): void | Promise<BooleanResponse> {
     const callback =
       typeof gaxOptionsOrCallback === 'function' ? gaxOptionsOrCallback : cb!;
@@ -438,7 +441,7 @@ Please use the format 'my-cluster' or '${instance.name}/clusters/my-cluster'.`);
    */
   get(
     gaxOptionsOrCallback?: CallOptions | GetClusterCallback,
-    cb?: GetClusterCallback
+    cb?: GetClusterCallback,
   ): void | Promise<GetClusterResponse> {
     const callback =
       typeof gaxOptionsOrCallback === 'function' ? gaxOptionsOrCallback : cb!;
@@ -451,7 +454,7 @@ Please use the format 'my-cluster' or '${instance.name}/clusters/my-cluster'.`);
       gaxOptions,
       (err?: ServiceError | null, metadata?: ICluster | null) => {
         callback(err, err ? null : this, metadata);
-      }
+      },
     );
   }
 
@@ -474,7 +477,7 @@ Please use the format 'my-cluster' or '${instance.name}/clusters/my-cluster'.`);
    */
   getBackups(
     optionsOrCallback?: GetBackupsOptions | GetBackupsCallback,
-    cb?: GetBackupsCallback
+    cb?: GetBackupsCallback,
   ): void | Promise<GetBackupsResponse> {
     let options =
       typeof optionsOrCallback === 'object' ? optionsOrCallback : {};
@@ -487,13 +490,13 @@ Please use the format 'my-cluster' or '${instance.name}/clusters/my-cluster'.`);
 
     const reqOpts: google.bigtable.admin.v2.IListBackupsRequest = {
       parent: this.name,
-      pageSize: gaxOpts.pageSize,
-      pageToken: gaxOpts.pageToken,
+      pageSize: (gaxOpts as GetBackupsOptions).pageSize,
+      pageToken: (gaxOpts as GetBackupsOptions).pageToken,
       ...options,
     };
 
-    delete gaxOpts.pageSize;
-    delete gaxOpts.pageToken;
+    delete (gaxOpts as GetBackupsOptions).pageSize;
+    delete (gaxOpts as GetBackupsOptions).pageToken;
     delete (reqOpts as CallOptions).autoPaginate;
     delete (reqOpts as GetBackupsOptions).gaxOptions;
 
@@ -522,6 +525,7 @@ Please use the format 'my-cluster' or '${instance.name}/clusters/my-cluster'.`);
             const backupInstance =
               this.id === '-'
                 ? this.instance
+                    // eslint-disable-next-line @typescript-eslint/no-non-null-asserted-optional-chain
                     .cluster(backup.name?.match(/clusters\/([^/]+)/)![1]!)
                     .backup(backup.name!.split('/').pop()!)
                 : this.backup(backup.name!.split('/').pop()!);
@@ -534,7 +538,7 @@ Please use the format 'my-cluster' or '${instance.name}/clusters/my-cluster'.`);
         const apiResp: google.bigtable.admin.v2.IListBackupsResponse = resp[2];
 
         callback(err, backups, nextQuery, apiResp);
-      }
+      },
     );
   }
 
@@ -594,6 +598,7 @@ Please use the format 'my-cluster' or '${instance.name}/clusters/my-cluster'.`);
           const backupInstance =
             this.id === '-'
               ? this.instance
+                  // eslint-disable-next-line @typescript-eslint/no-non-null-asserted-optional-chain
                   .cluster(backup.name?.match(/clusters\/([^/]+)/)![1]!)
                   .backup(backup.name!.split('/').pop()!)
               : this.backup(backup.name!.split('/').pop()!);
@@ -609,7 +614,7 @@ Please use the format 'my-cluster' or '${instance.name}/clusters/my-cluster'.`);
   getMetadata(callback: GetClusterMetadataCallback): void;
   getMetadata(
     gaxOptions: CallOptions,
-    callback: GetClusterMetadataCallback
+    callback: GetClusterMetadataCallback,
   ): void;
   /**
    * Get the cluster metadata.
@@ -627,7 +632,7 @@ Please use the format 'my-cluster' or '${instance.name}/clusters/my-cluster'.`);
    */
   getMetadata(
     gaxOptionsOrCallback?: CallOptions | GetClusterMetadataCallback,
-    cb?: GetClusterMetadataCallback
+    cb?: GetClusterMetadataCallback,
   ): void | Promise<GetClusterMetadataResponse> {
     const callback =
       typeof gaxOptionsOrCallback === 'function' ? gaxOptionsOrCallback : cb!;
@@ -650,22 +655,22 @@ Please use the format 'my-cluster' or '${instance.name}/clusters/my-cluster'.`);
           this.metadata = resp;
         }
         callback(err, resp);
-      }
+      },
     );
   }
 
   setMetadata(
     metadata: SetClusterMetadataOptions,
-    gaxOptions?: CallOptions
+    gaxOptions?: CallOptions,
   ): Promise<SetClusterMetadataResponse>;
   setMetadata(
     metadata: SetClusterMetadataOptions,
-    callback: SetClusterMetadataCallback
+    callback: SetClusterMetadataCallback,
   ): void;
   setMetadata(
     metadata: SetClusterMetadataOptions,
     gaxOptions: CallOptions,
-    callback: SetClusterMetadataCallback
+    callback: SetClusterMetadataCallback,
   ): void;
   /**
    * Set the cluster metadata.
@@ -686,36 +691,26 @@ Please use the format 'my-cluster' or '${instance.name}/clusters/my-cluster'.`);
   setMetadata(
     metadata: SetClusterMetadataOptions,
     gaxOptionsOrCallback?: CallOptions | SetClusterMetadataCallback,
-    cb?: SetClusterMetadataCallback
+    cb?: SetClusterMetadataCallback,
   ): void | Promise<SetClusterMetadataResponse> {
+    ClusterUtils.validateClusterMetadata(metadata);
     const callback =
       typeof gaxOptionsOrCallback === 'function' ? gaxOptionsOrCallback : cb!;
     const gaxOptions =
       typeof gaxOptionsOrCallback === 'object'
         ? gaxOptionsOrCallback
         : ({} as CallOptions);
-
-    const reqOpts: ICluster = Object.assign(
-      {},
-      {
-        name: this.name,
-        serveNodes: metadata.nodes,
-      },
-      metadata
-    );
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    delete (reqOpts as any).nodes;
-
+    const reqOpts = ClusterUtils.getRequestFromMetadata(metadata, this.name);
     this.bigtable.request<Operation>(
       {
         client: 'BigtableInstanceAdminClient',
-        method: 'updateCluster',
-        reqOpts,
+        method: 'partialUpdateCluster',
+        reqOpts: reqOpts,
         gaxOpts: gaxOptions,
       },
       (err, resp) => {
         callback(err, resp);
-      }
+      },
     );
   }
 }

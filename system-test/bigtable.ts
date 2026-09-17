@@ -16,43 +16,59 @@ import {replaceProjectIdToken} from '@google-cloud/projectify';
 import {PreciseDate} from '@google-cloud/precise-date';
 import * as assert from 'assert';
 import {beforeEach, afterEach, describe, it, before, after} from 'mocha';
-import Q from 'p-queue';
-import * as uuid from 'uuid';
 
-import {Backup, Bigtable, Instance} from '../src';
+import {
+  Backup,
+  BackupTimestamp,
+  Bigtable,
+  Entry,
+  Instance,
+  InstanceOptions,
+  MutateOptions,
+  SqlTypes,
+} from '../src';
+import {Mutation} from '../src/mutation';
 import {AppProfile} from '../src/app-profile.js';
+import {CopyBackupConfig} from '../src/backup.js';
 import {Cluster} from '../src/cluster.js';
 import {Family} from '../src/family.js';
 import {Row} from '../src/row.js';
 import {Table} from '../src/table.js';
 import {RawFilter} from '../src/filter';
+import {generateId, PREFIX} from './common';
+import {BigtableTableAdminClient} from '../src/v2';
+import {ServiceError} from 'google-gax';
+import {BigtableDate, QueryResultRow} from '../src/execute-query/values';
+import {google} from '../protos/protos';
 
-const PREFIX = 'gcloud-tests-';
+type IBackup = google.bigtable.admin.v2.IBackup;
 
 describe('Bigtable', () => {
   const bigtable = new Bigtable();
   const INSTANCE = bigtable.instance(generateId('instance'));
   const DIFF_INSTANCE = bigtable.instance(generateId('d-inst'));
   const CMEK_INSTANCE = bigtable.instance(generateId('cmek'));
+  const INSTANCE_HDD = bigtable.instance(generateId('inst-hdd'));
   const TABLE = INSTANCE.table(generateId('table'));
+  const TABLE_HDD = INSTANCE_HDD.table(generateId('table-hdd'));
   const APP_PROFILE_ID = generateId('appProfile');
   const APP_PROFILE = INSTANCE.appProfile(APP_PROFILE_ID);
   const CLUSTER_ID = generateId('cluster');
+  const CLUSTER_ID_HDD = generateId('cluster');
 
   async function reapBackups(instance: Instance) {
-    const [backups] = await instance.getBackups();
-    const q = new Q({concurrency: 5});
-    return Promise.all(
-      backups.map(backup => {
-        q.add(async () => {
-          try {
-            await backup.delete({timeout: 50 * 1000});
-          } catch (e) {
-            console.log(`Error deleting backup: ${backup.id}`);
-          }
-        });
-      })
-    );
+    try {
+      const [backups] = await instance.getBackups();
+      for (const backup of backups) {
+        try {
+          await backup.delete({timeout: 50 * 1000});
+        } catch (e) {
+          console.log(`Error deleting backup: ${backup.id}: ${e}`);
+        }
+      }
+    } catch (e) {
+      console.error(`Error listing backups from ${instance.name}: ${e}`);
+    }
   }
 
   async function reapInstances() {
@@ -65,30 +81,56 @@ describe('Bigtable', () => {
         const oneHourAgo = new Date(Date.now() - 3600000);
         return !timeCreated || timeCreated <= oneHourAgo;
       });
-    const q = new Q({concurrency: 5});
     // need to delete backups first due to instance deletion precondition
-    await Promise.all(testInstances.map(instance => reapBackups(instance)));
-    await Promise.all(
-      testInstances.map(instance => {
-        q.add(async () => {
-          try {
-            await instance.delete();
-          } catch (e) {
-            console.log(`Error deleting instance: ${instance.id}`);
-          }
-        });
-      })
+    const deleteBackupPromises = testInstances.map(instance =>
+      reapBackups(instance),
     );
+    for (const backupPromise of deleteBackupPromises) {
+      await backupPromise;
+    }
+    for (const instance of testInstances) {
+      try {
+        await instance.delete();
+      } catch (e) {
+        console.log(`Error deleting instance: ${instance.id}`);
+      }
+    }
   }
 
   before(async () => {
     await reapInstances();
-    const [, operation] = await INSTANCE.create(
-      createInstanceConfig(CLUSTER_ID, 'us-central1-c', 3, Date.now())
-    );
+    const [, operation] = await INSTANCE.create({
+      clusters: [
+        {
+          id: CLUSTER_ID,
+          location: 'us-central2-c',
+          nodes: 3,
+          storage: 'ssd',
+        },
+      ],
+      labels: {
+        time_created: Date.now(),
+      },
+    });
+    const [, operationHDD] = await INSTANCE_HDD.create({
+      clusters: [
+        {
+          id: CLUSTER_ID_HDD,
+          location: 'us-central2-c',
+          nodes: 3,
+          storage: 'hdd',
+        },
+      ],
+      labels: {
+        time_created: Date.now(),
+      },
+    });
 
-    await operation.promise();
+    await Promise.all([operation.promise(), operationHDD.promise()]);
     await TABLE.create({
+      families: ['follows', 'traits'],
+    });
+    await TABLE_HDD.create({
       families: ['follows', 'traits'],
     });
     await INSTANCE.createAppProfile(APP_PROFILE_ID, {
@@ -98,21 +140,21 @@ describe('Bigtable', () => {
   });
 
   after(async () => {
-    const q = new Q({concurrency: 5});
-    const instances = [INSTANCE, DIFF_INSTANCE, CMEK_INSTANCE];
+    const q = [];
+    const instances = [INSTANCE, DIFF_INSTANCE, CMEK_INSTANCE, INSTANCE_HDD];
 
     // need to delete backups first due to instance deletion precondition
     await Promise.all(instances.map(instance => reapBackups(instance)));
     await Promise.all(
       instances.map(instance => {
-        q.add(async () => {
+        q.push(async () => {
           try {
             await instance.delete();
           } catch (e) {
             console.log(`Error deleting instance: ${instance.id}`);
           }
         });
-      })
+      }),
     );
   });
 
@@ -157,9 +199,8 @@ describe('Bigtable', () => {
 
     it('should test Iam permissions for the instance', async () => {
       const permissions = ['bigtable.tables.get', 'bigtable.tables.readRows'];
-      const [grantedPermissions] = await INSTANCE.testIamPermissions(
-        permissions
-      );
+      const [grantedPermissions] =
+        await INSTANCE.testIamPermissions(permissions);
       assert.strictEqual(grantedPermissions.length, permissions.length);
       permissions.forEach(permission => {
         assert.strictEqual(grantedPermissions.includes(permission), true);
@@ -173,7 +214,7 @@ describe('Bigtable', () => {
         clusters: [
           {
             id: clusteId,
-            location: 'us-central1-c',
+            location: 'us-central2-c',
             nodes: 3,
           },
         ],
@@ -203,8 +244,8 @@ describe('Bigtable', () => {
 
     before(async () => {
       const projectId = await bigtable.auth.getProjectId();
-      kmsKeyName = `projects/${projectId}/locations/us-central1/keyRings/${keyRingId}/cryptoKeys/${cryptoKeyId}`;
-      keyRingsBaseUrl = `https://cloudkms.googleapis.com/v1/projects/${projectId}/locations/us-central1/keyRings`;
+      kmsKeyName = `projects/${projectId}/locations/us-central2/keyRings/${keyRingId}/cryptoKeys/${cryptoKeyId}`;
+      keyRingsBaseUrl = `https://cloudkms.googleapis.com/v1/projects/${projectId}/locations/us-central2/keyRings`;
 
       await bigtable.auth.request({
         method: 'POST',
@@ -218,13 +259,15 @@ describe('Bigtable', () => {
         params: {cryptoKeyId},
         data: {purpose: 'ENCRYPT_DECRYPT'},
       });
-      cryptoKeyVersionName = resp.data.primary.name;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cryptoKeyVersionName = (resp.data as any).primary.name;
 
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
       const [_, operation] = await CMEK_INSTANCE.create({
         clusters: [
           {
             id: CMEK_CLUSTER.id,
-            location: 'us-central1-a',
+            location: 'us-central2-a',
             nodes: 3,
             key: kmsKeyName,
           },
@@ -254,8 +297,9 @@ describe('Bigtable', () => {
     it('should create a cluster', async () => {
       const cluster = CMEK_INSTANCE.cluster(generateId('cluster'));
 
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
       const [_, operation] = await cluster.create({
-        location: 'us-central1-b',
+        location: 'us-central2-b',
         nodes: 3,
         key: kmsKeyName,
       });
@@ -269,14 +313,19 @@ describe('Bigtable', () => {
       const cluster = CMEK_INSTANCE.cluster(generateId('cluster'));
 
       try {
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
         const [_, operation] = await cluster.create({
-          location: 'us-central1-b',
+          location: 'us-central2-b',
           nodes: 3,
         });
         await operation.promise();
         throw new Error('Cluster creation should not have succeeded');
       } catch (e) {
-        assert(e.message.includes('default keys and CMEKs are not allowed'));
+        assert(
+          (e as Error).message.includes(
+            'default keys and CMEKs are not allowed',
+          ),
+        );
       }
     });
   });
@@ -330,7 +379,7 @@ describe('Bigtable', () => {
       const [metadata] = await APP_PROFILE.getMetadata();
       assert.strictEqual(
         metadata.name,
-        APP_PROFILE.name.replace('{{projectId}}', bigtable.projectId)
+        APP_PROFILE.name.replace('{{projectId}}', bigtable.projectId),
       );
     });
 
@@ -345,7 +394,7 @@ describe('Bigtable', () => {
       const [updatedAppProfile] = await APP_PROFILE.get();
       assert.strictEqual(
         updatedAppProfile.metadata!.description,
-        options.description
+        options.description,
       );
       assert.deepStrictEqual(updatedAppProfile.metadata!.singleClusterRouting, {
         clusterId: CLUSTER_ID,
@@ -465,7 +514,7 @@ describe('Bigtable', () => {
       const [metadata] = await TABLE.getMetadata();
       assert.strictEqual(
         metadata.name,
-        TABLE.name.replace('{{projectId}}', bigtable.projectId)
+        TABLE.name.replace('{{projectId}}', bigtable.projectId),
       );
     });
 
@@ -507,6 +556,27 @@ describe('Bigtable', () => {
     it('should return boolean for waitForReplication', async () => {
       const [res] = await TABLE.waitForReplication();
       assert.strictEqual(typeof res, 'boolean');
+    });
+  });
+
+  describe('consistency tokens with gapic', () => {
+    // We want to work with the gapic admin class for this version.
+    const tableAdmin = bigtable.admin.getTableAdminClient();
+
+    it('should wait for consistency without an existing token', async () => {
+      await tableAdmin.waitForConsistency(
+        replaceProjectIdToken(TABLE.name, bigtable.projectId),
+      );
+    });
+
+    it('should wait for consistency with an existing token', async () => {
+      const [token] = await tableAdmin.generateConsistencyToken({
+        name: replaceProjectIdToken(TABLE.name, bigtable.projectId),
+      });
+      await tableAdmin.waitForConsistency(
+        replaceProjectIdToken(TABLE.name, bigtable.projectId),
+        token.consistencyToken!,
+      );
     });
   });
 
@@ -778,6 +848,101 @@ describe('Bigtable', () => {
     });
 
     describe('fetching data', () => {
+      it('should execute a query', async () => {
+        const [preparedStatement] = await INSTANCE.prepareStatement({
+          query:
+            'SELECT @stringParam AS strCol, @bytesParam as bytesCol, @int64Param AS intCol, @doubleParam AS doubleCol,\n' +
+            '@floatParam AS floatCol, @boolParam AS boolCol, @tsParam AS tsCol, @dateParam AS dateCol,\n' +
+            '@byteArrayParam AS byteArrayCol, @stringArrayParam AS stringArrayCol, @intArrayParam AS intArrayCol,\n' +
+            '@floatArrayParam AS floatArrayCol, @doubleArrayParam AS doubleArrayCol, @boolArrayParam AS boolArrayCol,\n' +
+            '@tsArrayParam AS tsArrayCol, @dateArrayParam AS dateArrayCol',
+          parameterTypes: {
+            bytesParam: SqlTypes.Bytes(),
+            intArrayParam: SqlTypes.Array(SqlTypes.Int64()),
+            dateArrayParam: SqlTypes.Array(SqlTypes.Date()),
+            stringParam: SqlTypes.String(),
+            byteArrayParam: SqlTypes.Array(SqlTypes.Bytes()),
+            doubleArrayParam: SqlTypes.Array(SqlTypes.Float64()),
+            boolArrayParam: SqlTypes.Array(SqlTypes.Bool()),
+            doubleParam: SqlTypes.Float64(),
+            floatParam: SqlTypes.Float32(),
+            dateParam: SqlTypes.Date(),
+            floatArrayParam: SqlTypes.Array(SqlTypes.Float32()),
+            tsArrayParam: SqlTypes.Array(SqlTypes.Timestamp()),
+            int64Param: SqlTypes.Int64(),
+            boolParam: SqlTypes.Bool(),
+            tsParam: SqlTypes.Timestamp(),
+            stringArrayParam: SqlTypes.Array(SqlTypes.String()),
+          },
+        });
+        const params = {
+          bytesParam: Buffer.from('test'),
+          intArrayParam: [BigInt(1), BigInt(2), BigInt(3)],
+          dateArrayParam: [
+            new BigtableDate(2025, 5, 14),
+            new BigtableDate(2025, 5, 13),
+          ],
+          stringParam: 'test',
+          byteArrayParam: [Buffer.from('test')],
+          doubleArrayParam: [1.0, 2.0, 3.0],
+          boolArrayParam: [true, false],
+          doubleParam: 1.0,
+          floatParam: 1.0,
+          dateParam: new BigtableDate(2025, 5, 14),
+          floatArrayParam: [1.0, 2.0, 3.0],
+          tsArrayParam: [
+            new PreciseDate(Date.now()),
+            new PreciseDate(Date.now()),
+          ],
+          int64Param: BigInt(123),
+          boolParam: true,
+          tsParam: new PreciseDate(Date.now()),
+          stringArrayParam: ['test', 'test'],
+        };
+        const [rows] = (await INSTANCE.executeQuery({
+          preparedStatement,
+          parameters: params,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        })) as any as [Row[]];
+        assert(rows[0] instanceof QueryResultRow);
+        assert.deepStrictEqual(rows[0].get('strCol'), params.stringParam);
+        assert.deepStrictEqual(rows[0].get('bytesCol'), params.bytesParam);
+        assert.deepStrictEqual(rows[0].get('intCol'), params.int64Param);
+        assert.deepStrictEqual(rows[0].get('doubleCol'), params.doubleParam);
+        assert.deepStrictEqual(rows[0].get('floatCol'), params.floatParam);
+        assert.deepStrictEqual(rows[0].get('boolCol'), params.boolParam);
+        assert.deepStrictEqual(rows[0].get('tsCol'), params.tsParam);
+        assert.deepStrictEqual(rows[0].get('dateCol'), params.dateParam);
+        assert.deepStrictEqual(
+          rows[0].get('byteArrayCol'),
+          params.byteArrayParam,
+        );
+        assert.deepStrictEqual(
+          rows[0].get('stringArrayCol'),
+          params.stringArrayParam,
+        );
+        assert.deepStrictEqual(
+          rows[0].get('intArrayCol'),
+          params.intArrayParam,
+        );
+        assert.deepStrictEqual(
+          rows[0].get('floatArrayCol'),
+          params.floatArrayParam,
+        );
+        assert.deepStrictEqual(
+          rows[0].get('doubleArrayCol'),
+          params.doubleArrayParam,
+        );
+        assert.deepStrictEqual(
+          rows[0].get('boolArrayCol'),
+          params.boolArrayParam,
+        );
+        assert.deepStrictEqual(rows[0].get('tsArrayCol'), params.tsArrayParam);
+        assert.deepStrictEqual(
+          rows[0].get('dateArrayCol'),
+          params.dateArrayParam,
+        );
+      });
       it('should get rows', async () => {
         const [rows] = await TABLE.getRows();
         assert.strictEqual(rows.length, 4);
@@ -910,7 +1075,7 @@ describe('Bigtable', () => {
         ];
         await TABLE.insert(entries);
         const rows: Row[] = [];
-        await new Promise((resolve, reject) => {
+        await new Promise<void>((resolve, reject) => {
           const stream = TABLE.createReadStream()
             .on('error', reject)
             .on('data', row => {
@@ -1258,7 +1423,7 @@ describe('Bigtable', () => {
     // Struct, Date, or PreciseDate, to keep things easy this uses PreciseDate.
     const expireTime = new PreciseDate(PreciseDate.now() + 8 * 60 * 60 * 1000);
     const updateExpireTime = new PreciseDate(
-      expireTime.getTime() + 2 + 60 * 60 * 1000
+      expireTime.getTime() + 2 + 60 * 60 * 1000,
     );
 
     before(async () => {
@@ -1270,11 +1435,11 @@ describe('Bigtable', () => {
       await op.promise();
       backupNameFromCluster = replaceProjectIdToken(
         `${CLUSTER.name}/backups/${backupIdFromCluster}`,
-        bigtable.projectId
+        bigtable.projectId,
       );
       backupNameFromTable = replaceProjectIdToken(
         `${CLUSTER.name}/backups/${backupIdFromTable}`,
-        bigtable.projectId
+        bigtable.projectId,
       );
     });
 
@@ -1357,7 +1522,12 @@ describe('Bigtable', () => {
 
     it('should restore a backup to a different instance', async () => {
       const [, operation] = await DIFF_INSTANCE.create(
-        createInstanceConfig(generateId('d-clust'), 'us-east1-c', 3, Date.now())
+        createInstanceConfig(
+          generateId('d-clust'),
+          'us-east1-c',
+          3,
+          Date.now(),
+        ),
       );
       await operation.promise();
       const [iExists] = await DIFF_INSTANCE.exists();
@@ -1410,28 +1580,1086 @@ describe('Bigtable', () => {
 
       Object.keys(policy).forEach(key => assert(key in updatedPolicy));
     });
+    describe('copying backups', () => {
+      // The server requires the copy backup time to be sufficiently ahead of
+      // the create backup time to avoid an error.
+      // Set it to 308 hours ahead
+      const sourceExpireTimeMilliseconds =
+        PreciseDate.now() + (8 + 300) * 60 * 60 * 1000;
+      const sourceExpireTime = new PreciseDate(sourceExpireTimeMilliseconds);
+      // 608 hours ahead of now, 300 hours ahead of sourceExpireTimeMilliseconds
+      const copyExpireTimeMilliseconds =
+        PreciseDate.now() + (8 + 600) * 60 * 60 * 1000;
+      const copyExpireTime = new PreciseDate(copyExpireTimeMilliseconds);
+
+      beforeEach(async () => {
+        // Sleep here for just over a minute so that the system tests don't
+        // experience quota issues due to too many requests per minute.
+        await new Promise(resolve => {
+          setTimeout(resolve, 60001);
+        });
+      });
+      /*
+        This function checks that when a backup is copied using the provided
+        config that a new backup is created on the instance.
+       */
+      async function testCopyBackup(
+        backup: Backup,
+        config: CopyBackupConfig,
+        instance: Instance,
+      ) {
+        // Get a list of backup ids before the copy
+        const [backupsBeforeCopy] = await instance.getBackups();
+        const backupIdsBeforeCopy = backupsBeforeCopy.map(backup => backup.id);
+        // Copy the backup
+        const [newBackup, operation] = await backup.copy(config);
+        try {
+          assert.strictEqual(config.id, newBackup.id);
+          await operation.promise();
+          const id = config.id;
+          const backupPath = `${config.cluster.name}/backups/${id}`;
+          {
+            // Ensure that the backup specified by the config and id match the backup name for the operation returned by the server.
+            // the split/map/join functions replace the project name with the {{projectId}} string
+            assert(operation);
+            assert(operation.metadata);
+            assert.strictEqual(
+              operation.metadata.name
+                .split('/')
+                .map((item, index) => (index === 1 ? '{{projectId}}' : item))
+                .join('/'),
+              backupPath
+                .split('/')
+                .map((item, index) => (index === 1 ? '{{projectId}}' : item))
+                .join('/'),
+            );
+          }
+          // Check that there is now one more backup
+          const [backupsAfterCopy] = await instance.getBackups();
+          const newBackups = backupsAfterCopy.filter(
+            backup => !backupIdsBeforeCopy.includes(backup.id),
+          );
+          assert.strictEqual(newBackups.length, 1);
+          const [fetchedNewBackup] = newBackups;
+          // Ensure the fetched backup matches the config
+          assert.strictEqual(fetchedNewBackup.id, id);
+          assert.strictEqual(fetchedNewBackup.name, backupPath);
+          // Delete the copied backup
+        } finally {
+          await config.cluster.backup(newBackup.id).delete();
+        }
+      }
+
+      describe('should create backup of a table and copy it in the same cluster', async () => {
+        async function testWithExpiryTimes(
+          sourceTestExpireTime: BackupTimestamp,
+          copyTestExpireTime: BackupTimestamp,
+        ) {
+          const [backup, op] = await TABLE.createBackup(generateId('backup'), {
+            expireTime: sourceTestExpireTime,
+          });
+          try {
+            {
+              await op.promise();
+              // Check expiry time for running operation.
+              await backup.getMetadata();
+              assert.deepStrictEqual(backup.expireDate, sourceExpireTime);
+            }
+            await testCopyBackup(
+              backup,
+              {
+                cluster: backup.cluster,
+                id: generateId('backup'),
+                expireTime: copyTestExpireTime,
+              },
+              INSTANCE,
+            );
+          } finally {
+            await backup.delete();
+          }
+        }
+        it('should copy to the same cluster with precise date expiry times', async () => {
+          await testWithExpiryTimes(sourceExpireTime, copyExpireTime);
+        });
+        it('should copy to the same cluster with timestamp expiry times', async () => {
+          // Calling toStruct converts times to a timestamp object.
+          // For example: sourceExpireTime.toStruct() = {seconds: 1706659851, nanos: 981000000}
+          await testWithExpiryTimes(
+            sourceExpireTime.toStruct(),
+            copyExpireTime.toStruct(),
+          );
+        });
+        it('should copy to the same cluster with date expiry times', async () => {
+          await testWithExpiryTimes(
+            new Date(sourceExpireTimeMilliseconds),
+            new Date(copyExpireTimeMilliseconds),
+          );
+        });
+      });
+      it('should create backup of a table and copy it on another cluster of another instance', async () => {
+        const [backup, op] = await TABLE.createBackup(generateId('backup'), {
+          expireTime: sourceExpireTime,
+        });
+        try {
+          {
+            await op.promise();
+            // Check the expiry time.
+            await backup.getMetadata();
+            assert.deepStrictEqual(backup.expireDate, sourceExpireTime);
+          }
+          // Create another instance
+          const instance = bigtable.instance(generateId('instance'));
+          const destinationClusterId = generateId('cluster');
+          {
+            // Create production instance with given options
+            const instanceOptions: InstanceOptions = {
+              clusters: [
+                {
+                  id: destinationClusterId,
+                  nodes: 3,
+                  location: 'us-central2-d',
+                  storage: 'ssd',
+                },
+              ],
+              labels: {'prod-label': 'prod-label'},
+              type: 'production',
+            };
+            const [, operation] = await instance.create(instanceOptions);
+            await operation.promise();
+          }
+          // Create the copy and test the copied backup
+          await testCopyBackup(
+            backup,
+            {
+              cluster: new Cluster(instance, destinationClusterId),
+              id: generateId('backup'),
+              expireTime: copyExpireTime,
+            },
+            instance,
+          );
+          await instance.delete();
+        } finally {
+          await backup.delete();
+        }
+      });
+      it('should create backup of a table and copy it on another cluster of the same instance', async () => {
+        const [backup, op] = await TABLE.createBackup(generateId('backup'), {
+          expireTime: sourceExpireTime,
+        });
+        try {
+          {
+            await op.promise();
+            // Check the expiry time.
+            await backup.getMetadata();
+            assert.deepStrictEqual(backup.expireDate, sourceExpireTime);
+          }
+          const destinationClusterId = generateId('cluster');
+          {
+            // Create destination cluster with given options
+            const [, operation] = await INSTANCE.cluster(
+              destinationClusterId,
+            ).create({
+              location: 'us-central2-b',
+              nodes: 3,
+            });
+            await operation.promise();
+          }
+          // Create the copy and test the copied backup
+          await testCopyBackup(
+            backup,
+            {
+              cluster: new Cluster(INSTANCE, destinationClusterId),
+              id: generateId('backup'),
+              expireTime: copyExpireTime,
+            },
+            INSTANCE,
+          );
+        } finally {
+          await backup.delete();
+        }
+      });
+      it('should create backup of a table and copy it on another project', async () => {
+        const [backup, op] = await TABLE.createBackup(generateId('backup'), {
+          expireTime: sourceExpireTime,
+        });
+        try {
+          {
+            await op.promise();
+            // Check the expiry time.
+            await backup.getMetadata();
+            assert.deepStrictEqual(backup.expireDate, sourceExpireTime);
+          }
+          // Create client, instance, cluster for second project
+          const bigtableSecondaryProject = new Bigtable(
+            process.env.GCLOUD_PROJECT2
+              ? {projectId: process.env.GCLOUD_PROJECT2}
+              : {},
+          );
+          const secondInstance = bigtableSecondaryProject.instance(
+            generateId('instance'),
+          );
+          const destinationClusterId = generateId('cluster');
+          {
+            // Create production instance with given options
+            const instanceOptions: InstanceOptions = {
+              clusters: [
+                {
+                  id: destinationClusterId,
+                  nodes: 3,
+                  location: 'us-central2-d',
+                  storage: 'ssd',
+                },
+              ],
+              labels: {'prod-label': 'prod-label'},
+              type: 'production',
+            };
+            const [, operation] = await secondInstance.create(instanceOptions);
+            await operation.promise();
+          }
+          // Create the copy and test the copied backup
+          await testCopyBackup(
+            backup,
+            {
+              cluster: new Cluster(secondInstance, destinationClusterId),
+              id: generateId('backup'),
+              expireTime: copyExpireTime,
+            },
+            secondInstance,
+          );
+          await secondInstance.delete();
+        } finally {
+          await backup.delete();
+        }
+      });
+      it('should restore a copied backup', async () => {
+        const backupId = generateId('backup');
+        const table = INSTANCE.table('old-table');
+        {
+          // Create a table and insert data into it.
+          await table.create();
+          await table.createFamily('follows');
+          await table.insert([
+            {
+              key: 'some-data-to-copy-key',
+              data: {
+                follows: {
+                  copyData: 'data-to-copy',
+                },
+              },
+            },
+          ]);
+        }
+        // Create the backup
+        const [backup, createBackupOperation] = await table.createBackup(
+          backupId,
+          {
+            expireTime: sourceExpireTime,
+          },
+        );
+        try {
+          await createBackupOperation.promise();
+          // Copy the backup
+          const config = {
+            cluster: backup.cluster,
+            id: generateId('backup'),
+            expireTime: copyExpireTime,
+          };
+          const [newBackup, copyOperation] = await backup.copy(config);
+          await copyOperation.promise();
+          // Restore a table from the copied backup
+          const [newTable, restoreOperation] =
+            await newBackup.restore('new-table');
+          await restoreOperation.promise();
+          const rows = await newTable.getRows();
+          assert.deepStrictEqual(rows[0][0].id, 'some-data-to-copy-key');
+        } finally {
+          await backup.delete();
+        }
+      });
+    });
+  });
+
+  describe('backups with gapic', () => {
+    // This only needs to test the handwritten pieces for optimizing, so a lot
+    // of the above from the veneer tests isn't covered; also I've not converted
+    // everything to gapic, just the pieces to be tested.
+    const tableAdmin = bigtable.admin.getTableAdminClient();
+
+    let backupSSD: IBackup, backupHDD: IBackup;
+
+    const targetTableIdSSD = generateId('ttbl'),
+      targetTableIdHDD = generateId('ttbl');
+
+    // We just test from table here.
+    const backupIdFromTableSSD = generateId('backup'),
+      backupIdFromTableHDD = generateId('backup');
+    let backupNameFromTableSSD: string, backupNameFromTableHDD: string;
+
+    // The minimum backup expiry time is 6 hours. The times here each have a 2
+    // hour padding to tolerate latency and clock drift. Also, while the time
+    // implementation for backups in this client accepts any of a Timestamp
+    // Struct, Date, or PreciseDate, to keep things easy this uses PreciseDate.
+    const expireTime = {
+      seconds: Date.now() / 1000 + 8 * 60 * 60,
+      nanos: 0,
+    };
+
+    beforeEach(async () => {
+      // This is not ideal, but we are running into quota issues for admin API access.
+      await new Promise(r => setTimeout(r, 60 * 1000));
+    });
+
+    before(async () => {
+      const [backupOpSSD] = await tableAdmin.createBackup({
+        parent: replaceProjectIdToken(
+          INSTANCE.cluster(CLUSTER_ID).name,
+          bigtable.projectId,
+        ),
+        backupId: backupIdFromTableSSD,
+        backup: {
+          expireTime,
+          sourceTable: replaceProjectIdToken(TABLE.name, bigtable.projectId),
+        },
+      });
+      const [backupOpHDD] = await tableAdmin.createBackup({
+        parent: replaceProjectIdToken(
+          INSTANCE_HDD.cluster(CLUSTER_ID_HDD).name,
+          bigtable.projectId,
+        ),
+        backupId: backupIdFromTableHDD,
+        backup: {
+          expireTime,
+          sourceTable: replaceProjectIdToken(
+            TABLE_HDD.name,
+            bigtable.projectId,
+          ),
+        },
+      });
+      const [resSSD, resHDD] = await Promise.all([
+        backupOpSSD.promise(),
+        backupOpHDD.promise(),
+      ]);
+
+      backupNameFromTableSSD = replaceProjectIdToken(
+        `${INSTANCE.cluster(CLUSTER_ID).name}/backups/${backupIdFromTableSSD}`,
+        bigtable.projectId,
+      );
+      backupNameFromTableHDD = replaceProjectIdToken(
+        `${INSTANCE_HDD.cluster(CLUSTER_ID_HDD).name}/backups/${backupIdFromTableHDD}`,
+        bigtable.projectId,
+      );
+      console.log(backupNameFromTableSSD, backupNameFromTableHDD);
+
+      backupSSD = resSSD[0];
+      backupHDD = resHDD[0];
+    });
+
+    // This is here just to make sure that we are, in fact, getting a usable backup.
+    it('should create backup of a table (from table)', async () => {
+      assert.strictEqual(backupSSD.name, backupNameFromTableSSD);
+      assert.strictEqual(
+        new Number(backupSSD.expireTime?.seconds).valueOf(),
+        Math.floor(expireTime.seconds),
+      );
+
+      assert.strictEqual(backupHDD.name, backupNameFromTableHDD);
+      assert.strictEqual(
+        new Number(backupHDD.expireTime?.seconds).valueOf(),
+        Math.floor(expireTime.seconds),
+      );
+    });
+
+    it('should not optimize when restoring from the same backing type', async () => {
+      // HDD -> HDD and SSD -> SSD should both not trigger an optimize pass.
+      const [restoreOp] = await tableAdmin.restoreTable({
+        parent: replaceProjectIdToken(INSTANCE_HDD.name, bigtable.projectId),
+        tableId: targetTableIdHDD,
+        backup: backupHDD.name!,
+      });
+      const [, metadata] = await restoreOp.promise();
+      assert.ok(!metadata.optimizeTableOperationName);
+    });
+
+    it('should optimize when restoring from a different backing type', async () => {
+      // HDD -> SSD should trigger an optimize.
+      const [restoreOp] = await tableAdmin.restoreTable({
+        parent: replaceProjectIdToken(INSTANCE.name, bigtable.projectId),
+        tableId: targetTableIdSSD,
+        backup: backupHDD.name!,
+      });
+      const [, metadata] = await restoreOp.promise();
+      assert.ok(metadata.optimizeTableOperationName);
+
+      const optimizeOp = await tableAdmin.checkOptimizeRestoredTableProgress(
+        metadata.optimizeTableOperationName,
+      );
+      await optimizeOp.promise();
+    });
+  });
+
+  describe('AuthorizedViews', () => {
+    const tableId = generateId('table');
+    const familyName = generateId('column-family-name');
+    const rowId = generateId('row-id');
+    const otherRowId = generateId('row-id');
+    const authorizedViewId = generateId('authorized-view-id');
+    const columnIdInView = generateId('column-id');
+    const columnIdNotInView = generateId('column-id');
+    const cellValueInView = generateId('cell-value');
+    const cellValueInView2 = generateId('cell-value');
+    const cellValueNotInView = generateId('cell-value');
+    const newCellValue = generateId('cell-value');
+    const authorizedViewTable = INSTANCE.table(tableId);
+    const authorizedView = INSTANCE.view(tableId, authorizedViewId);
+    const columnIdInViewData = {
+      value: cellValueInView,
+      labels: [],
+      timestamp: '77000',
+    };
+    const columnIdInViewData2 = {
+      value: cellValueInView2,
+      labels: [],
+      timestamp: '77000',
+    };
+    const columnIdNotInViewData = {
+      value: cellValueNotInView,
+      labels: [],
+      timestamp: '77000',
+    };
+    const newCellValueData = {
+      value: newCellValue,
+      labels: [],
+      timestamp: '77000',
+    };
+    let authorizedViewTableFullName: string;
+    let authorizedViewFullName: string;
+
+    /**
+     * getErrorMessage gets the error message that the test would expect
+     * for a particular authorizedViewFullName.
+     *
+     * @param authorizedViewFullName The full name of the authorized view.
+     * This method should only be called after authorizedViewFullName has
+     * been initialized.
+     */
+    function getErrorMessage(authorizedViewFullName: string) {
+      return `Cannot mutate from ${authorizedViewFullName} because the mutation contains cells outside the Authorized View.`;
+    }
+
+    /**
+     * Resets the table to a stable state after running a test.
+     *
+     */
+    async function resetTable() {
+      // Change the cell value back to what it was:
+      await authorizedViewTable.deleteRows(rowId);
+      const firstMutation = {
+        key: rowId,
+        data: {
+          [familyName]: {
+            [columnIdInView]: columnIdInViewData,
+            [columnIdNotInView]: columnIdNotInViewData,
+          },
+        },
+      } as {} as Entry;
+      await authorizedViewTable.insert(firstMutation, {});
+    }
+
+    /**
+     * Creates the table used for the tests.
+     */
+    async function createTable() {
+      {
+        // Create a table with just one row.
+        await authorizedViewTable.create({});
+        await authorizedViewTable.createFamily(familyName);
+        await authorizedViewTable.insert([
+          {
+            key: rowId,
+            data: {
+              [familyName]: {
+                [columnIdInView]: columnIdInViewData,
+                [columnIdNotInView]: columnIdNotInViewData,
+              },
+            },
+          },
+          {
+            key: otherRowId,
+            data: {
+              [familyName]: {
+                [columnIdInView]: columnIdInViewData,
+              },
+            },
+          },
+        ]);
+        // The following operations must be performed after table.insert because bigtable.projectId needs to be assigned.
+        authorizedViewTableFullName = authorizedViewTable.name.replace(
+          '{{projectId}}',
+          bigtable.projectId,
+        );
+        authorizedViewFullName = `${authorizedViewTableFullName}/authorizedViews/${authorizedViewId}`;
+      }
+      {
+        // Create an authorized view that the integration tests can use.
+        // The view should only see the columnIdInView column.
+        const bigtableClient = bigtable.api[
+          'BigtableTableAdminClient'
+        ] as BigtableTableAdminClient;
+        await bigtableClient.createAuthorizedView({
+          parent: authorizedViewTableFullName,
+          authorizedViewId,
+          authorizedView: {
+            etag: `${authorizedViewId}-etag`,
+            deletionProtection: false,
+            subsetView: {
+              rowPrefixes: [Buffer.from(rowId)],
+              familySubsets: {
+                [familyName]: {
+                  qualifiers: [Buffer.from(columnIdInView)],
+                },
+              },
+            },
+          },
+        });
+      }
+    }
+
+    before(async () => {
+      await createTable();
+    });
+
+    afterEach(async () => {
+      // Add an after hook to ensure that none of the tests change the table.
+      const rows = (await authorizedViewTable.getRows())[0];
+      assert.strictEqual(rows.length, 2);
+      assert.strictEqual(rows[0].id, rowId);
+      assert.deepStrictEqual(rows[0].data, {
+        [familyName]: {
+          [columnIdInView]: [columnIdInViewData],
+          [columnIdNotInView]: [columnIdNotInViewData],
+        },
+      });
+      assert.strictEqual(rows[1].id, otherRowId);
+      assert.deepStrictEqual(rows[1].data, {
+        [familyName]: {
+          [columnIdInView]: [columnIdInViewData],
+        },
+      });
+    });
+
+    describe('ReadRows grpc calls', () => {
+      it('should call getRows for the authorized view', async () => {
+        const rows = (await authorizedView.getRows())[0];
+        // The getRows call will only get one of the rows and only display
+        // one of the columns visible in the view.
+        assert.strictEqual(rows[0].id, rowId);
+        assert.deepStrictEqual(rows[0].data, {
+          [familyName]: {
+            [columnIdInView]: [columnIdInViewData],
+          },
+        });
+      });
+      it('should call createReadStream for the authorized view', done => {
+        (async () => {
+          try {
+            const stream = await authorizedView.createReadStream();
+            let receivedDataCount = 0;
+            stream.on('data', row => {
+              assert.strictEqual(row.id, rowId);
+              assert.deepStrictEqual(row.data, {
+                [familyName]: {
+                  [columnIdInView]: [columnIdInViewData],
+                },
+              });
+              receivedDataCount = receivedDataCount + 1;
+            });
+            stream.on('error', () => {
+              done('An error should not have occurred');
+            });
+            stream.on('end', () => {
+              assert.strictEqual(receivedDataCount, 1);
+              done();
+            });
+          } catch (e: unknown) {
+            done(e);
+          }
+        })().catch(err => {
+          throw err;
+        });
+      });
+    });
+    describe('MutateRows grpc calls', () => {
+      describe('For erroneous calls', () => {
+        it('should fail when writing to a row not in the authorized view', async () => {
+          const mutation = {
+            key: otherRowId,
+            data: {
+              [familyName]: {
+                [columnIdInView]: newCellValue,
+              },
+            },
+            method: Mutation.methods.INSERT,
+          } as {} as Entry;
+          try {
+            await authorizedView.mutate(mutation, {} as MutateOptions);
+            assert.fail('The mutate call should have failed');
+          } catch (e: unknown) {
+            assert.strictEqual(
+              (e as ServiceError).message,
+              getErrorMessage(authorizedViewFullName),
+            );
+          }
+        });
+        it('should fail when writing to a column not in the authorized view', async () => {
+          const mutation = {
+            key: rowId,
+            data: {
+              [familyName]: {
+                [columnIdNotInView]: newCellValue,
+              },
+            },
+            method: Mutation.methods.INSERT,
+          } as {} as Entry;
+          try {
+            await authorizedView.mutate(mutation, {} as MutateOptions);
+            assert.fail('The mutate call should have failed');
+          } catch (e: unknown) {
+            assert.strictEqual(
+              (e as ServiceError).message,
+              getErrorMessage(authorizedViewFullName),
+            );
+          }
+        });
+      });
+      it('should mutate a row for a row/column in view', async () => {
+        // Change the cell in view to a new value.
+        const firstMutation = {
+          key: rowId,
+          data: {
+            [familyName]: {
+              [columnIdInView]: newCellValueData,
+            },
+          },
+          method: Mutation.methods.INSERT,
+        } as {} as Entry;
+        await authorizedView.mutate(firstMutation, {} as MutateOptions);
+        // Ensure the new cell value change took place
+        const rows = (await authorizedView.getRows())[0];
+        assert.strictEqual(rows[0].id, rowId);
+        assert.deepStrictEqual(rows[0].data, {
+          [familyName]: {
+            [columnIdInView]: [newCellValueData],
+          },
+        });
+        // Change the cell value back to what it was before
+        const secondMutation = {
+          key: rowId,
+          data: {
+            [familyName]: {
+              [columnIdInView]: columnIdInViewData,
+            },
+          },
+          method: Mutation.methods.INSERT,
+        } as {} as Entry;
+        await authorizedView.mutate(secondMutation, {} as MutateOptions);
+      });
+      it('should insert a row for a row/column in view', async () => {
+        // Change the cell in view to a new value.
+        const firstMutation = {
+          key: rowId,
+          data: {
+            [familyName]: {
+              [columnIdInView]: newCellValueData,
+            },
+          },
+        } as {} as Entry;
+        await authorizedView.insert(firstMutation, {});
+        // Ensure the new cell value change took place
+        const rows = (await authorizedView.getRows())[0];
+        assert.strictEqual(rows[0].id, rowId);
+        assert.deepStrictEqual(rows[0].data, {
+          [familyName]: {
+            [columnIdInView]: [newCellValueData],
+          },
+        });
+        // Change the cell value back to what it was before
+        const secondMutation = {
+          key: rowId,
+          data: {
+            [familyName]: {
+              [columnIdInView]: columnIdInViewData,
+            },
+          },
+          method: Mutation.methods.INSERT,
+        } as {} as Entry;
+        await authorizedView.insert(secondMutation, {});
+      });
+    });
+    describe('SampleRowKeys grpc calls', () => {
+      /**
+       * This function is for converting a buffer to an integer equal to the
+       * total value of the buffer. It is useful for comparing the sampleRowKeys
+       * return value to the row identifier since the difference between the
+       * total value of these buffers is expected to be exactly 1.
+       *
+       * @param buffer The buffer being mapped to be used for comparisons.
+       */
+      function convertBufferToInt(buffer: Uint8Array) {
+        return buffer
+          .reverse()
+          .reduce(
+            (accumulator, currentValue, index) =>
+              accumulator + Math.pow(currentValue, index),
+            0,
+          );
+      }
+
+      it('should get a sample of row keys', async () => {
+        const rowKeys = await authorizedView.sampleRowKeys();
+        assert.strictEqual(rowKeys.length, 1);
+        assert.strictEqual(rowKeys[0].length, 1);
+        assert.deepStrictEqual(
+          convertBufferToInt(rowKeys[0][0].key),
+          convertBufferToInt(Buffer.from(rowId)) + 1,
+        );
+      });
+      it('should call sampleRowKeysStream for the authorized view', done => {
+        (async () => {
+          try {
+            const stream = await authorizedView.sampleRowKeysStream();
+            let receivedDataCount = 0;
+            stream.on('data', (row: {key: Uint8Array; offset: string}) => {
+              assert.deepStrictEqual(
+                convertBufferToInt(row.key),
+                convertBufferToInt(Buffer.from(rowId)) + 1,
+              );
+              receivedDataCount = receivedDataCount + 1;
+            });
+            stream.on('error', () => {
+              done('An error should not have occurred');
+            });
+            stream.on('end', () => {
+              assert.strictEqual(receivedDataCount, 1);
+              done();
+            });
+          } catch (e: unknown) {
+            done(e);
+          }
+        })().catch(err => {
+          throw err;
+        });
+      });
+    });
+    describe('CheckAndMutate grpc calls', () => {
+      it('should error when the request is made for the row key not in a view', done => {
+        (async () => {
+          try {
+            try {
+              await authorizedView.filter(
+                {
+                  rowId: 'some-row-key',
+                  filter: {
+                    column: columnIdInView,
+                  },
+                },
+                {
+                  onMatch: [
+                    {
+                      key: rowId,
+                      method: 'delete',
+                    },
+                  ],
+                },
+              );
+              done('The call to filter should have failed.');
+            } catch (e: unknown) {
+              assert.strictEqual(
+                (e as ServiceError).details,
+                getErrorMessage(authorizedViewFullName),
+              );
+              done();
+            }
+          } catch (e: unknown) {
+            // Will reach this point if there is an assertion error.
+            done(e);
+          }
+        })().catch(err => {
+          throw err;
+        });
+      });
+      it('should call filter for the authorized view', done => {
+        (async () => {
+          try {
+            // Add the row so that the cell offset filter takes effect:
+            await authorizedViewTable.insert([
+              {
+                key: rowId,
+                data: {
+                  [familyName]: {
+                    [columnIdInView]: [columnIdInViewData, columnIdInViewData2],
+                  },
+                },
+              },
+            ]);
+            const rowsAfterAddition = (await authorizedViewTable.getRows())[0];
+            assert.strictEqual(rowsAfterAddition.length, 2);
+            assert.strictEqual(rowsAfterAddition[0].id, rowId);
+            assert.deepStrictEqual(
+              rowsAfterAddition[0].data[familyName][columnIdNotInView].length,
+              1,
+            );
+            assert.deepStrictEqual(
+              rowsAfterAddition[0].data[familyName][columnIdInView].length,
+              2,
+            );
+            assert.strictEqual(rowsAfterAddition[1].id, otherRowId);
+            assert.deepStrictEqual(rowsAfterAddition[1].data, {
+              [familyName]: {
+                [columnIdInView]: [columnIdInViewData],
+              },
+            });
+            // Call filter to conduct a checkAndMutate operation.
+            const mutations = [
+              {
+                method: 'delete',
+                data: [`${familyName}:${columnIdInView}`],
+              },
+            ];
+            await authorizedView.filter(
+              {
+                rowId: rowId,
+                filter: {
+                  row: {
+                    cellOffset: 1,
+                  },
+                },
+              },
+              {
+                onMatch: mutations,
+              },
+            );
+            // Check the rows to ensure the row was deleted by calling `filter`.
+            const rows = (await authorizedViewTable.getRows())[0];
+            assert.strictEqual(rows.length, 2);
+            assert.strictEqual(rows[0].id, rowId);
+            assert.deepStrictEqual(rows[0].data, {
+              [familyName]: {
+                [columnIdNotInView]: [columnIdNotInViewData],
+                // [columnIdInView] is deleted by checkAndMutate
+              },
+            });
+            assert.strictEqual(rows[1].id, otherRowId);
+            assert.deepStrictEqual(rows[1].data, {
+              [familyName]: {
+                [columnIdInView]: [columnIdInViewData],
+              },
+            });
+            // Add the row that was deleted back:
+            await authorizedViewTable.insert([
+              {
+                key: rowId,
+                data: {
+                  [familyName]: {
+                    [columnIdInView]: {
+                      value: cellValueInView,
+                      labels: [],
+                      timestamp: 77000,
+                    },
+                  },
+                },
+              },
+            ]);
+            done();
+          } catch (e: unknown) {
+            done(e);
+          }
+        })().catch(err => {
+          throw err;
+        });
+      });
+    });
+    describe('ReadModifyWriteRow grpc calls', () => {
+      it('should apply read/modify/write rules to a row', async () => {
+        // Append a value to the table:
+        const rule = {
+          column: `${familyName}:${columnIdInView}`,
+          append: '-appended-value',
+        };
+        await authorizedView.createRules({
+          rowId,
+          rules: rule,
+        });
+        // Check that the operation was performed correctly:
+        const rows = (await authorizedView.getRows())[0];
+        rows[0].data[familyName][columnIdInView][0].timestamp = '77000';
+        assert.strictEqual(rows.length, 1);
+        assert.strictEqual(rows[0].id, rowId);
+        assert.deepStrictEqual(rows[0].data, {
+          [familyName]: {
+            [columnIdInView]: [
+              {
+                value: `${cellValueInView}-appended-value`,
+                labels: [],
+                timestamp: '77000',
+              },
+              columnIdInViewData,
+            ],
+          },
+        });
+        await resetTable();
+      });
+      it('should apply increment to a row', async () => {
+        // First set the row in view cell value to a numeric value:
+        const originalValue = Math.floor(Math.random() * 1000000000);
+        await authorizedViewTable.deleteRows(rowId);
+        const firstMutation = {
+          key: rowId,
+          data: {
+            [familyName]: {
+              [columnIdInView]: {
+                value: originalValue,
+                labels: [],
+                timestamp: '77000',
+              },
+              [columnIdNotInView]: columnIdNotInViewData,
+            },
+          },
+        } as {} as Entry;
+        await authorizedViewTable.insert(firstMutation, {});
+        // Next, increment the value:
+        await authorizedView.increment(
+          {
+            rowId,
+            column: `${familyName}:${columnIdInView}`,
+          },
+          1,
+        );
+        const rows = (await authorizedView.getRows())[0];
+        rows[0].data[familyName][columnIdInView][0].timestamp = '77000';
+        assert.deepStrictEqual(rows[0].data, {
+          [familyName]: {
+            [columnIdInView]: [
+              {
+                value: originalValue + 1,
+                labels: [],
+                timestamp: '77000',
+              },
+              {
+                value: originalValue,
+                labels: [],
+                timestamp: '77000',
+              },
+            ],
+          },
+        });
+        await resetTable();
+      });
+    });
+  });
+
+  describe('mutateRows entries tests', () => {
+    const table = INSTANCE.table(generateId('table'));
+
+    afterEach(async () => {
+      await table.delete();
+    });
+
+    it('should only insert one row in the table with mutate', async () => {
+      // Create table
+      const tableOptions = {
+        families: ['columnFamily'],
+      };
+      await table.create(tableOptions);
+      // Add entries
+      const entry = {
+        columnFamily: {
+          column: 1,
+        },
+      };
+      const mutation = {
+        key: 'rowKey',
+        data: entry,
+        method: Mutation.methods.INSERT,
+      };
+      const gaxOptions = {maxRetries: 4};
+      await table.mutate(mutation, {gaxOptions});
+      // Get rows and compare
+      const [rows] = await table.getRows();
+      assert.strictEqual(rows.length, 1);
+    });
+
+    it('should insert one row in the table using mutate in a similar way to how the documentation says to use insert', async () => {
+      // Create table
+      const tableOptions = {
+        families: ['columnFamily'],
+      };
+      await table.create(tableOptions);
+      // Add entries
+      const mutation = {
+        key: 'rowKey',
+        data: {
+          columnFamily: {
+            column: 1,
+          },
+        },
+        method: Mutation.methods.INSERT,
+      };
+      const gaxOptions = {maxRetries: 4};
+      await table.mutate(mutation, {gaxOptions});
+      // Get rows and compare
+      const [rows] = await table.getRows();
+      assert.strictEqual(rows.length, 1);
+    });
+
+    it('should only insert one row in the table with insert as described by the GCP documentation', async () => {
+      // Create table
+      const tableOptions = {
+        families: ['follows'],
+      };
+      await table.create(tableOptions);
+      // Add entries
+      const greetings = ['Hello World!', 'Hello Bigtable!', 'Hello Node!'];
+      const rowsToInsert = greetings.map((greeting, index) => ({
+        key: `greeting${index}`,
+        data: {
+          follows: {
+            // 'follows' is the column family
+            someColumn: {
+              // Setting the timestamp allows the client to perform retries. If
+              // server-side time is used, retries may cause multiple cells to
+              // be generated.
+              timestamp: new Date(),
+              value: greeting,
+            },
+          },
+        },
+      }));
+      await table.insert(rowsToInsert);
+      // Get rows and compare
+      const [rows] = await table.getRows();
+      assert.strictEqual(rows.length, 3);
+    });
   });
 });
 
-function generateId(resourceType: string) {
-  return PREFIX + resourceType + '-' + uuid.v1().substr(0, 8);
-}
 function createInstanceConfig(
   clusterId: string,
   location: string,
   nodes: number,
-  time_created: number
+  time_created: number,
+  storage?: 'ssd' | 'hdd',
 ) {
   return {
     clusters: [
       {
         id: clusterId,
-        location: location,
-        nodes: nodes,
+        location,
+        nodes,
+        storage,
       },
     ],
     labels: {
-      time_created: time_created,
+      time_created,
     },
   };
 }

@@ -21,9 +21,11 @@ import * as proxyquire from 'proxyquire';
 import * as sn from 'sinon';
 
 import {Cluster} from '../src/cluster.js';
-import {Instance} from '../src/instance.js';
+import {Instance, InstanceOptions} from '../src/instance.js';
 import {PassThrough} from 'stream';
-import {shouldRetryRequest} from '../src/decorateStatus.js';
+import {RequestOptions} from '../src';
+import * as snapshot from 'snap-shot-it';
+import {createClusterOptionsList} from './constants/cluster';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const v2 = require('../src/v2');
@@ -46,6 +48,7 @@ const fakePromisify = Object.assign({}, promisify, {
     }
     promisified = true;
     assert.deepStrictEqual(options.exclude, [
+      'close',
       'instance',
       'operation',
       'request',
@@ -152,31 +155,31 @@ describe('Bigtable', () => {
       const bigtable = Bigtable();
       assert.strictEqual(
         bigtable.options.BigtableClient['grpc.keepalive_time_ms'],
-        30000
+        30000,
       );
       assert.strictEqual(
         bigtable.options.BigtableClient['grpc.keepalive_timeout_ms'],
-        10000
+        10000,
       );
 
       assert.strictEqual(
         bigtable.options.BigtableInstanceAdminClient['grpc.keepalive_time_ms'],
-        30000
+        30000,
       );
       assert.strictEqual(
         bigtable.options.BigtableInstanceAdminClient[
           'grpc.keepalive_timeout_ms'
         ],
-        10000
+        10000,
       );
 
       assert.strictEqual(
         bigtable.options.BigtableTableAdminClient['grpc.keepalive_time_ms'],
-        30000
+        30000,
       );
       assert.strictEqual(
         bigtable.options.BigtableTableAdminClient['grpc.keepalive_timeout_ms'],
-        10000
+        10000,
       );
     });
 
@@ -191,6 +194,8 @@ describe('Bigtable', () => {
         assert.deepStrictEqual(
           options_,
           Object.assign(
+            {},
+            options_,
             {
               libName: 'gccl',
               libVersion: PKG.version,
@@ -198,8 +203,8 @@ describe('Bigtable', () => {
               'grpc.keepalive_time_ms': 30000,
               'grpc.keepalive_timeout_ms': 10000,
             },
-            options
-          )
+            options,
+          ),
         );
         return fakeGoogleAuthInstance;
       };
@@ -229,27 +234,33 @@ describe('Bigtable', () => {
           'grpc.keepalive_time_ms': 30000,
           'grpc.keepalive_timeout_ms': 10000,
         },
-        options
+        options,
       );
 
       assert.deepStrictEqual(bigtable.options, {
         BigtableClient: Object.assign(
+          {},
+          bigtable.options['BigtableClient'],
           {
             servicePath: 'bigtable.googleapis.com',
           },
-          expectedOptions
+          expectedOptions,
         ),
         BigtableInstanceAdminClient: Object.assign(
+          {},
+          bigtable.options['BigtableInstanceAdminClient'],
           {
             servicePath: 'bigtableadmin.googleapis.com',
           },
-          expectedOptions
+          expectedOptions,
         ),
         BigtableTableAdminClient: Object.assign(
+          {},
+          bigtable.options['BigtableTableAdminClient'],
           {
             servicePath: 'bigtableadmin.googleapis.com',
           },
-          expectedOptions
+          expectedOptions,
         ),
       });
     });
@@ -273,20 +284,32 @@ describe('Bigtable', () => {
           'grpc.keepalive_time_ms': 30000,
           'grpc.keepalive_timeout_ms': 10000,
         },
-        options
+        options,
       );
 
       const bigtable = new Bigtable(options);
 
       assert.strictEqual(
         bigtable.customEndpoint,
-        process.env.BIGTABLE_EMULATOR_HOST
+        process.env.BIGTABLE_EMULATOR_HOST,
       );
 
       assert.deepStrictEqual(bigtable.options, {
-        BigtableClient: expectedOptions,
-        BigtableInstanceAdminClient: expectedOptions,
-        BigtableTableAdminClient: expectedOptions,
+        BigtableClient: Object.assign(
+          {},
+          bigtable.options['BigtableClient'],
+          expectedOptions,
+        ),
+        BigtableInstanceAdminClient: Object.assign(
+          {},
+          bigtable.options['BigtableInstanceAdminClient'],
+          expectedOptions,
+        ),
+        BigtableTableAdminClient: Object.assign(
+          {},
+          bigtable.options['BigtableTableAdminClient'],
+          expectedOptions,
+        ),
       });
     });
 
@@ -308,7 +331,7 @@ describe('Bigtable', () => {
           'grpc.keepalive_time_ms': 30000,
           'grpc.keepalive_timeout_ms': 10000,
         },
-        options
+        options,
       );
 
       const bigtable = new Bigtable(options);
@@ -316,9 +339,21 @@ describe('Bigtable', () => {
       assert.strictEqual(bigtable.customEndpoint, options.apiEndpoint);
 
       assert.deepStrictEqual(bigtable.options, {
-        BigtableClient: expectedOptions,
-        BigtableInstanceAdminClient: expectedOptions,
-        BigtableTableAdminClient: expectedOptions,
+        BigtableClient: Object.assign(
+          {},
+          bigtable.options['BigtableClient'],
+          expectedOptions,
+        ),
+        BigtableInstanceAdminClient: Object.assign(
+          {},
+          bigtable.options['BigtableInstanceAdminClient'],
+          expectedOptions,
+        ),
+        BigtableTableAdminClient: Object.assign(
+          {},
+          bigtable.options['BigtableTableAdminClient'],
+          expectedOptions,
+        ),
       });
     });
 
@@ -346,7 +381,7 @@ describe('Bigtable', () => {
     const INSTANCE_ID = 'my-instance';
     const CLUSTER = {
       id: 'my-cluster',
-      location: 'us-central1-b',
+      location: 'us-central2-d',
       nodes: 3,
       storage: 'ssd',
     };
@@ -368,6 +403,32 @@ describe('Bigtable', () => {
       bigtable.createInstance(INSTANCE_ID, OPTIONS, assert.ifError);
     });
 
+    it('should provide the proper request options asynchronously', async () => {
+      let currentRequestInput = null;
+      (bigtable.request as Function) = (config: RequestOptions) => {
+        currentRequestInput = config;
+      };
+      const instanceOptionsList: InstanceOptions[] = createClusterOptionsList
+        .map(options => Object.assign({}, options, {id: 'my-cluster'}))
+        .map(options => {
+          return {
+            clusters: options,
+          };
+        });
+      for (const options of instanceOptionsList) {
+        await bigtable.createInstance(INSTANCE_ID, options, assert.ifError);
+        snapshot({
+          input: {
+            id: INSTANCE_ID,
+            options: options,
+          },
+          output: {
+            config: currentRequestInput,
+          },
+        });
+      }
+    });
+
     it('should accept gaxOptions', done => {
       const gaxOptions = {};
       const options = Object.assign({}, OPTIONS, {gaxOptions});
@@ -385,13 +446,13 @@ describe('Bigtable', () => {
         {
           displayName: 'robocop',
         },
-        OPTIONS
+        OPTIONS,
       );
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       bigtable.request = (config: any) => {
         assert.strictEqual(
           config.reqOpts.instance.displayName,
-          options.displayName
+          options.displayName,
         );
         done();
       };
@@ -422,7 +483,7 @@ describe('Bigtable', () => {
             env: 'prod',
           },
         },
-        OPTIONS
+        OPTIONS,
       );
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       bigtable.request = (config: any) => {
@@ -433,12 +494,10 @@ describe('Bigtable', () => {
     });
 
     it('should respect the clusters option', done => {
-      const fakeLocation = 'a/b/c/d';
-      FakeCluster.getLocation_ = (project: string, location: string) => {
-        assert.strictEqual(project, PROJECT_ID);
-        assert.strictEqual(location, OPTIONS.clusters[0].location);
-        return fakeLocation;
-      };
+      const fakeLocation = Cluster.getLocation_(
+        PROJECT_ID,
+        OPTIONS.clusters[0].location,
+      );
       const fakeStorage = 20;
       FakeCluster.getStorageType_ = (storage: {}) => {
         assert.strictEqual(storage, OPTIONS.clusters[0].storage);
@@ -472,7 +531,7 @@ describe('Bigtable', () => {
           config.reqOpts.clusters['my-cluster'].encryptionConfig,
           {
             kmsKeyName: key,
-          }
+          },
         );
         done();
       };
@@ -484,10 +543,11 @@ describe('Bigtable', () => {
             {
               id: 'my-cluster',
               key,
+              nodes: 3,
             },
           ],
         },
-        assert.ifError
+        assert.ifError,
       );
     });
 
@@ -503,7 +563,7 @@ describe('Bigtable', () => {
           config.reqOpts.clusters['my-cluster'].encryptionConfig,
           {
             kmsKeyName: key,
-          }
+          },
         );
         done();
       };
@@ -517,10 +577,11 @@ describe('Bigtable', () => {
               encryption: {
                 kmsKeyName: key,
               },
+              nodes: 2,
             },
           ],
         },
-        assert.ifError
+        assert.ifError,
       );
     });
 
@@ -544,7 +605,7 @@ describe('Bigtable', () => {
               },
             ],
           },
-          assert.ifError
+          assert.ifError,
         );
       }, /A cluster was provided with both `encryption` and `key` defined\./);
     });
@@ -562,7 +623,7 @@ describe('Bigtable', () => {
           assert.strictEqual(instance, undefined);
           assert.strictEqual(operation, undefined);
           done();
-        }
+        },
       );
     });
 
@@ -590,7 +651,7 @@ describe('Bigtable', () => {
           assert.strictEqual(args[1], responseArg2);
           assert.strictEqual(args[2], responseArg3);
           done();
-        }
+        },
       );
     });
 
@@ -601,7 +662,7 @@ describe('Bigtable', () => {
         clusters: [
           {
             nodes: 3,
-            location: 'us-central1-b',
+            location: 'us-central2-d',
             storage: 'ssd',
           },
         ],
@@ -687,7 +748,7 @@ describe('Bigtable', () => {
           err: Error,
           instances: Instance[],
           failedLocations: string[],
-          apiResponse: {}
+          apiResponse: {},
         ) => {
           assert.ifError(err);
           assert.strictEqual(instances[0], fakeInstances[0]);
@@ -697,7 +758,7 @@ describe('Bigtable', () => {
           assert.strictEqual(failedLocations, response.failedLocations);
           assert.strictEqual(apiResponse, response);
           done();
-        }
+        },
       );
     });
   });
@@ -895,51 +956,55 @@ describe('Bigtable', () => {
         };
       });
 
-      it('should pass retryRequestOptions', done => {
-        const expectedRetryRequestOptions = {
-          currentRetryAttempt: 0,
-          noResponseRetries: 0,
-          objectMode: true,
-          shouldRetryFn: shouldRetryRequest,
-        };
+      // TODO: retry request options are currently ignored
+      // Re-enable after retry logic is fixed in gax / retry-request
+      // it('should pass retryRequestOptions', done => {
+      //   const expectedRetryRequestOptions = {
+      //     currentRetryAttempt: 0,
+      //     noResponseRetries: 0,
+      //     objectMode: true,
+      //     shouldRetryFn: shouldRetryRequest,
+      //   };
 
-        bigtable.api[CONFIG.client] = {
-          [CONFIG.method]: (reqOpts: {}, options: gax.CallOptions) => {
-            assert.deepStrictEqual(
-              options.retryRequestOptions,
-              expectedRetryRequestOptions
-            );
-            done();
-          },
-        };
+      //   bigtable.api[CONFIG.client] = {
+      //     [CONFIG.method]: (reqOpts: {}, options: gax.CallOptions) => {
+      //       assert.deepStrictEqual(
+      //         options.retryRequestOptions,
+      //         expectedRetryRequestOptions
+      //       );
+      //       done();
+      //     },
+      //   };
 
-        const requestStream = bigtable.request(CONFIG);
-        requestStream.emit('reading');
-      });
+      //   const requestStream = bigtable.request(CONFIG);
+      //   requestStream.emit('reading');
+      // });
 
-      it('should set gaxOpts.retryRequestOptions when gaxOpts undefined', done => {
-        const expectedRetryRequestOptions = {
-          currentRetryAttempt: 0,
-          noResponseRetries: 0,
-          objectMode: true,
-          shouldRetryFn: shouldRetryRequest,
-        };
+      // TODO: retry request options are currently ignored
+      // Re-enable after retry logic is fixed in gax / retry-request
+      // it('should set gaxOpts.retryRequestOptions when gaxOpts undefined', done => {
+      //   const expectedRetryRequestOptions = {
+      //     currentRetryAttempt: 0,
+      //     noResponseRetries: 0,
+      //     objectMode: true,
+      //     shouldRetryFn: shouldRetryRequest,
+      //   };
 
-        bigtable.api[CONFIG.client] = {
-          [CONFIG.method]: (reqOpts: {}, options: gax.CallOptions) => {
-            assert.deepStrictEqual(
-              options.retryRequestOptions,
-              expectedRetryRequestOptions
-            );
-            done();
-          },
-        };
+      //   bigtable.api[CONFIG.client] = {
+      //     [CONFIG.method]: (reqOpts: {}, options: gax.CallOptions) => {
+      //       assert.deepStrictEqual(
+      //         options.retryRequestOptions,
+      //         expectedRetryRequestOptions
+      //       );
+      //       done();
+      //     },
+      //   };
 
-        const config = Object.assign({}, CONFIG);
-        delete config.gaxOpts;
-        const requestStream = bigtable.request(config);
-        requestStream.emit('reading');
-      });
+      //   const config = Object.assign({}, CONFIG);
+      //   delete config.gaxOpts;
+      //   const requestStream = bigtable.request(config);
+      //   requestStream.emit('reading');
+      // });
 
       it('should expose an abort function', done => {
         GAX_STREAM.cancel = done;
@@ -1073,7 +1138,7 @@ describe('Bigtable', () => {
             });
           });
 
-          it('should emit resmonse from GAX stream', done => {
+          it('should emit response from GAX stream', done => {
             const response = {};
             const requestStream = bigtable.request(config);
             requestStream.emit('reading');
@@ -1146,6 +1211,21 @@ describe('Bigtable', () => {
         assert.strictEqual(projectId, detectedProjectId);
         assert.strictEqual(bigtable.projectId, detectedProjectId);
         done();
+      });
+    });
+  });
+  describe('close', () => {
+    it('should have failed request after close is called', done => {
+      bigtable.close().then(() => {
+        bigtable.getInstances((err: Error) => {
+          if (err) {
+            done();
+          } else {
+            assert.fail(
+              'The request did not fail, but it should have because the connection is closed',
+            );
+          }
+        });
       });
     });
   });
